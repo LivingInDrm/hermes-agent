@@ -3009,6 +3009,27 @@ DEFAULT_CONFIG = {
         # crash/restart, as before.
         "delivery_ledger": True,
 
+        # Shared-session runtime delegation (route-scoped, default OFF).
+        # When enabled for a platform+route, the messaging gateway stops
+        # running a local AIAgent for normal inbound chat messages and
+        # instead submits the prepared turn to the profile's `hermes serve`
+        # runtime over its WebSocket RPC (`turn.submit`), then delivers the
+        # runtime's final reply back to the platform.  The gateway keeps its
+        # entire channel control plane (auth, pairing, commands, session
+        # keys, media/STT, sender prefix, reply context, channel prompt) —
+        # only model/tool execution moves to serve.  The runtime endpoint is
+        # resolved from the HERMES_DESKTOP_RUNTIME_URL /
+        # HERMES_DESKTOP_RUNTIME_TOKEN env vars first (stamped by the
+        # Desktop supervisor), falling back to `url` / `token` below.
+        # See docs/design/channel-desktop-shared-session-runtime.md.
+        "runtime_delegate": {
+            "enabled": False,
+            "platforms": [],           # e.g. ["feishu"]
+            "event_routes": ["message_receive"],
+            "url": "",                 # fallback when HERMES_DESKTOP_RUNTIME_URL unset
+            "token": "",               # fallback when HERMES_DESKTOP_RUNTIME_TOKEN unset
+        },
+
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular
         # can blow past the old fixed 30s when an account has many slash

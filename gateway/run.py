@@ -69,6 +69,10 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+# Runtime delegation: how long the gateway waits for a delegated serve turn
+# to reach a terminal state (turn.completed/interrupted/failed) before
+# surfacing a timeout to the chat. Generous — matches inline turn budgets.
+_RUNTIME_DELEGATE_TURN_TIMEOUT_SECONDS = 1800.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -5902,6 +5906,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "internal", False):
             return False
 
+        # --- Runtime-delegated routes: forward to serve's per-session FIFO ---
+        # (shared-session runtime design §8.1). While a delegated turn is in
+        # flight, a follow-up message must NOT wait in the gateway's
+        # post-enqueue busy queue (the steer/queue/interrupt machinery
+        # below) — serve owns turn ordering (busy_mode=fifo), so submit it
+        # immediately and let serve queue it behind the running turn. Two
+        # rapid inputs thus both hold runtime sequences before the first
+        # completes, and nothing gateway-side waits on model completion.
+        # Ordering: the approval branch above already consumed plain-text
+        # approval answers, and internal events never reach here
+        # (_runtime_delegate_enabled_for returns False for them too).
+        if self._runtime_delegate_enabled_for(event.source, event=event):
+            task = asyncio.create_task(
+                self._submit_busy_followup_to_runtime(event, session_key)
+            )
+            tasks = getattr(self, "_background_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._background_tasks = tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            return True
+
         running_agent = self._running_agents.get(session_key)
 
         effective_mode = self._busy_input_mode
@@ -7234,6 +7261,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             source = entry.origin
+
+            # Runtime-delegated routes must not synthesize model-rerunning
+            # resume events at startup — serve owns turn recovery for them
+            # (shared-session runtime design §12.2). Final-reply redelivery
+            # (_redeliver_pending_obligations) is unaffected and still runs
+            # for these sessions.
+            try:
+                if self._runtime_delegate_enabled_for(source):
+                    logger.info(
+                        "Skipping auto-resume for %s: platform %s is "
+                        "runtime-delegated",
+                        entry.session_key,
+                        getattr(source.platform, "value", source.platform),
+                    )
+                    continue
+            except Exception:
+                pass
+
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -12983,6 +13028,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -18499,6 +18545,530 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return url.rstrip("/")
         return None
 
+    # ------------------------------------------------------------------
+    # Runtime delegation (shared-session runtime, gateway-delegation
+    # milestone). When gateway.runtime_delegate enables a platform+route,
+    # normal inbound chat turns are submitted to the profile's
+    # `hermes serve` runtime over its WS RPC (turn.submit) instead of
+    # running a local AIAgent; the gateway keeps its entire channel
+    # control plane and delivers the runtime's final reply through its
+    # normal delivery path. See
+    # docs/design/channel-desktop-shared-session-runtime.md §5.2/§7 and
+    # gateway/runtime_client.py.
+    # ------------------------------------------------------------------
+
+    def _runtime_delegate_config(self) -> dict:
+        """Return gateway.runtime_delegate config (cached; {} = disabled)."""
+        cached = getattr(self, "_runtime_delegate_cfg", None)
+        if cached is not None:
+            return cached
+        cfg = getattr(getattr(self, "config", None), "runtime_delegate", None)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        self._runtime_delegate_cfg = cfg
+        return cfg
+
+    def _runtime_delegate_endpoint(self) -> Optional[tuple]:
+        """Resolve the serve runtime (url, token), or None when unresolvable.
+
+        Env vars stamped by the Desktop supervisor win
+        (HERMES_DESKTOP_RUNTIME_URL / HERMES_DESKTOP_RUNTIME_TOKEN);
+        gateway.runtime_delegate.url / .token are the config fallback.
+        """
+        cfg = self._runtime_delegate_config()
+        url = (
+            os.getenv("HERMES_DESKTOP_RUNTIME_URL", "").strip()
+            or str(cfg.get("url") or "").strip()
+        )
+        token = (
+            os.getenv("HERMES_DESKTOP_RUNTIME_TOKEN", "").strip()
+            or str(cfg.get("token") or "").strip()
+        )
+        if url and token:
+            return url, token
+        return None
+
+    def _runtime_delegate_enabled_for(self, source, event=None) -> bool:
+        """Whether this inbound source's turn should be delegated to serve.
+
+        True only when ALL hold: the event is a real inbound message (never
+        internal/synthetic events like startup auto-resume or background
+        completion notes — those must not become model-rerunning serve
+        turns), gateway.runtime_delegate.enabled is set, the source platform
+        is listed in .platforms, "message_receive" is a routed event, and
+        the runtime URL+token resolve (env first, config fallback).
+        """
+        if event is not None and getattr(event, "internal", False):
+            return False
+        cfg = self._runtime_delegate_config()
+        if not cfg or not cfg.get("enabled"):
+            return False
+        try:
+            platform_value = source.platform.value
+        except AttributeError:
+            return False
+        platforms = cfg.get("platforms") or []
+        if platform_value not in platforms:
+            return False
+        event_routes = cfg.get("event_routes")
+        if event_routes is None:
+            event_routes = ["message_receive"]
+        if "message_receive" not in event_routes:
+            return False
+        return self._runtime_delegate_endpoint() is not None
+
+    def _get_runtime_client(self):
+        """Lazy singleton GatewayRuntimeClient for this gateway process."""
+        client = getattr(self, "_runtime_client", None)
+        if client is not None:
+            return client
+        endpoint = self._runtime_delegate_endpoint()
+        if endpoint is None:
+            raise RuntimeError("runtime delegation endpoint is not configured")
+        from gateway.runtime_client import GatewayRuntimeClient
+        url, token = endpoint
+        client = GatewayRuntimeClient(url, token, logger=logger)
+        self._runtime_client = client
+        return client
+
+    async def _run_turn_via_runtime(
+        self,
+        *,
+        message: str,
+        context_prompt: str,
+        history: List[Dict[str, Any]],
+        source: "SessionSource",
+        session_id: str,
+        session_key: str = None,
+        run_generation: Optional[int] = None,
+        event_message_id: Optional[str] = None,
+        channel_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Submit the prepared turn to the profile's `hermes serve` runtime.
+
+        Mirrors the ``_run_agent_via_proxy`` return contract: a dict with
+        ``final_response`` (delivered by the CALLER through the normal
+        delivery-ledger + adapter send path), ``messages``/``api_calls``/
+        ``tools``/``history_offset``/``session_id``/``response_previewed``.
+        ``agent_persisted`` is always True: serve owns the stored session,
+        so the gateway's transcript block must skip its session-DB write.
+
+        Delegation invariants (design §5.2/§12.3):
+        - never constructs an AIAgent and never touches self._agent_cache;
+        - never writes this turn's messages into the gateway session DB;
+        - NO fallback to the local agent on failure — errors surface to the
+          chat exactly like inline errors (via the returned final_response),
+          and a turn whose events were lost is "unknown", never replayed.
+        """
+        from gateway.runtime_client import (
+            RUNTIME_QUEUE_FULL_CODE,
+            RuntimeRequestError,
+        )
+
+        def _result(final_text: str, **extra) -> Dict[str, Any]:
+            out = {
+                "final_response": final_text,
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+                "history_offset": len(history),
+                "session_id": session_id,
+                "response_previewed": False,
+                # Serve owns persistence for delegated turns — the caller's
+                # transcript block reads this flag and skips the session-DB
+                # write (skip_db=True) for everything this turn produced.
+                "agent_persisted": True,
+            }
+            out.update(extra)
+            return out
+
+        def _run_still_current() -> bool:
+            if run_generation is None or not session_key:
+                return True
+            return self._is_session_run_current(session_key, run_generation)
+
+        # Ephemeral system prompt: same composition as the inline path
+        # (platform context + event channel_prompt + configured channel
+        # prompt) — passed to serve as ephemeral_prompt, never concatenated
+        # into the user message.
+        combined_ephemeral = context_prompt or ""
+        _event_channel_prompt = (channel_prompt or "").strip()
+        if _event_channel_prompt:
+            combined_ephemeral = (
+                combined_ephemeral + "\n\n" + _event_channel_prompt
+            ).strip()
+        try:
+            _cfg_channel_prompt = self._get_system_prompt_for_channel(
+                source.platform,
+                source.chat_id or "",
+                thread_id=getattr(source, "thread_id", None),
+                parent_id=getattr(source, "parent_chat_id", None),
+            )
+        except Exception:
+            _cfg_channel_prompt = None
+        if _cfg_channel_prompt:
+            combined_ephemeral = (
+                combined_ephemeral + "\n\n" + _cfg_channel_prompt
+            ).strip()
+
+        # Conversation identity: reuse the serve stored session already
+        # bound to this gateway session key, else have serve channel-create
+        # one keyed by the session key. The binding lives in an in-memory
+        # map for now (rebuilt lazily after restart via channel-create
+        # idempotency on source_session_key).
+        stored_ids = getattr(self, "_runtime_stored_ids", None)
+        if stored_ids is None:
+            stored_ids = {}
+            self._runtime_stored_ids = stored_ids
+        stored_id = stored_ids.get(session_key) if session_key else None
+        if not stored_id and session_key:
+            # Best-effort: consult the gateway_routing entry in case a prior
+            # component recorded the binding there.
+            try:
+                _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                stored_id = getattr(_entry, "runtime_stored_session_id", None) or None
+            except Exception:
+                stored_id = None
+        if stored_id:
+            conversation = {"kind": "stored", "stored_session_id": stored_id}
+        else:
+            conversation = {
+                "kind": "channel-create",
+                "source": source.platform.value,
+                "source_session_key": session_key or "",
+            }
+
+        # client_turn_id must be globally unique across chats: session_key
+        # already encodes the conversation identity, so a platform message
+        # id that is only unique within one chat cannot collide.
+        import uuid as _uuid
+        client_turn_id = "{}:{}:{}".format(
+            source.platform.value,
+            session_key or source.chat_id or "",
+            event_message_id or _uuid.uuid4().hex,
+        )
+
+        trusted_source = {
+            "platform": source.platform.value,
+            "chat_type": getattr(source, "chat_type", "") or "",
+            "chat_name": getattr(source, "chat_name", None) or "",
+            "user_id": getattr(source, "user_id", None) or "",
+            "user_id_alt": getattr(source, "user_id_alt", None) or "",
+            "user_name": getattr(source, "user_name", None) or "",
+            "thread_id": str(getattr(source, "thread_id", None) or ""),
+            # The gateway authorized this sender before reaching the agent
+            # path (allowlists/pairing), so the turn arrives pre-authorized.
+            "role_authorized": True,
+        }
+
+        # Allowlisted execution hints from the session /model override, when
+        # trivially available; otherwise omitted (serve resolves its own
+        # config).
+        execution_hints: Dict[str, Any] = {}
+        try:
+            _override = (
+                self._session_model_overrides.get(session_key)
+                if session_key
+                else None
+            )
+            if isinstance(_override, dict):
+                for _hint in (
+                    "model",
+                    "provider",
+                    "reasoning_effort",
+                    "service_tier",
+                    "max_iterations",
+                ):
+                    _value = _override.get(_hint)
+                    if _value not in (None, ""):
+                        execution_hints[_hint] = _value
+        except Exception:
+            execution_hints = {}
+
+        try:
+            profile = (getattr(source, "profile", None) or "").strip()
+            if not profile:
+                profile = (self._profile_name_for_source(source) or "").strip()
+        except Exception:
+            profile = ""
+
+        submit_params: Dict[str, Any] = {
+            "profile": profile,
+            "conversation": conversation,
+            "client_turn_id": client_turn_id,
+            "message": message,
+            "trusted_source": trusted_source,
+            # Gateway authority requires origin-channel delivery: this WS
+            # connection is the per-turn delivery sink and the gateway sends
+            # the final reply to the platform itself.
+            "delivery_mode": "origin-channel",
+            "delivery_sink_id": "gateway:{}".format(
+                session_key or source.chat_id or "unknown"
+            ),
+            "busy_mode": "fifo",
+        }
+        if combined_ephemeral:
+            submit_params["ephemeral_prompt"] = combined_ephemeral
+        if execution_hints:
+            submit_params["execution_hints"] = execution_hints
+
+        # Typing indicator while serve runs the turn (best-effort, mirrors
+        # the proxy path).
+        _adapter = self._adapter_for_source(source)
+        if _adapter:
+            try:
+                await _adapter.send_typing(
+                    source.chat_id,
+                    metadata=self._thread_metadata_for_source(
+                        source, event_message_id
+                    ),
+                )
+            except Exception:
+                pass
+
+        try:
+            client = self._get_runtime_client()
+            handle = await client.submit_turn(submit_params)
+        except RuntimeRequestError as exc:
+            if exc.code == RUNTIME_QUEUE_FULL_CODE:
+                # Retryable busy: serve's per-session turn queue is full.
+                logger.warning(
+                    "Runtime delegation: serve queue full for %s",
+                    session_key or "?",
+                )
+                return _result(
+                    "⏳ The agent has too many queued requests right now — "
+                    "please try again in a moment.",
+                    failed=True,
+                    error="runtime turn queue full (4290)",
+                )
+            logger.error(
+                "Runtime delegation submit failed for %s: %s",
+                session_key or "?", exc,
+            )
+            return _result(
+                f"⚠️ Runtime delegation error: {exc}",
+                failed=True,
+                error=str(exc),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Design §12.3: no fallback to a local AIAgent — surface the
+            # failure to the chat like any inline error.
+            logger.error(
+                "Runtime delegation connection failed for %s: %s",
+                session_key or "?", exc,
+            )
+            return _result(
+                f"⚠️ Runtime delegation error: {exc}",
+                failed=True,
+                error=str(exc),
+            )
+
+        # Remember the serve stored-session binding for this session key.
+        if session_key and handle.stored_session_id:
+            stored_ids[session_key] = handle.stored_session_id
+            # Best-effort gateway_routing stamp so external tooling can see
+            # the binding; the in-memory map above is the working copy.
+            try:
+                _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                if _entry is not None:
+                    _entry.runtime_stored_session_id = handle.stored_session_id
+            except Exception:
+                pass
+
+        logger.info(
+            "runtime delegation: enqueued turn %s for %s (stored=%s status=%s)",
+            handle.turn_id, session_key or "?",
+            handle.stored_session_id or "?", handle.status or "?",
+        )
+
+        try:
+            # Generous per-turn budget matching inline turn budgets. shield()
+            # keeps the handle future usable by the client on timeout.
+            outcome = await asyncio.wait_for(
+                asyncio.shield(handle.future),
+                timeout=_RUNTIME_DELEGATE_TURN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Runtime delegation: turn %s timed out after %ds for %s",
+                handle.turn_id,
+                int(_RUNTIME_DELEGATE_TURN_TIMEOUT_SECONDS),
+                session_key or "?",
+            )
+            return _result(
+                "⚠️ The delegated turn timed out — the agent runtime did not "
+                "finish in time. Try again.",
+                failed=True,
+                error="runtime turn timeout",
+            )
+        except asyncio.CancelledError:
+            raise
+
+        if not _run_still_current():
+            logger.info(
+                "Discarding stale runtime-delegated result for %s — "
+                "generation %d is no longer current",
+                session_key or "?",
+                run_generation or 0,
+            )
+            return _result("")
+
+        state = str(outcome.get("state") or "unknown")
+        final_text = str(outcome.get("final_text") or "")
+        already_delivered = bool(outcome.get("already_delivered"))
+        logger.info(
+            "runtime delegation: turn %s finished state=%s response=%d chars",
+            handle.turn_id, state, len(final_text),
+        )
+
+        if state == "completed":
+            turn_messages = [{"role": "user", "content": message}]
+            if final_text:
+                turn_messages.append(
+                    {"role": "assistant", "content": final_text}
+                )
+            return _result(
+                final_text,
+                messages=turn_messages,
+                api_calls=1,
+                response_previewed=already_delivered and bool(final_text),
+            )
+        if state == "interrupted":
+            # Mirror inline interrupt semantics: an interrupted run that did
+            # work stays silent (the user steered it deliberately).
+            return _result("", api_calls=1, interrupted=True)
+
+        # failed / unknown → surface like an inline error. "unknown" means
+        # the WS dropped mid-turn: the outcome was lost and is never
+        # auto-replayed (design §12.3).
+        error_detail = str(outcome.get("error") or "") or (
+            "runtime connection lost mid-turn; the turn outcome is unknown"
+            if state == "unknown"
+            else "runtime turn failed"
+        )
+        return _result(
+            final_text,
+            api_calls=1,
+            failed=True,
+            error=error_detail,
+        )
+
+    async def _submit_busy_followup_to_runtime(
+        self,
+        event: "MessageEvent",
+        session_key: str,
+    ) -> None:
+        """Submit a mid-turn follow-up straight to serve's per-session FIFO.
+
+        Fire-and-forget worker spawned by
+        ``_handle_active_session_busy_message`` for runtime-delegated routes
+        (shared-session runtime design §8.1): the gateway keeps NO
+        post-enqueue model-wait queue, so a message arriving while a
+        delegated turn is running is submitted immediately — serve's
+        ``busy_mode: fifo`` queues it behind the running turn and both
+        turns hold runtime sequences before the first completes. This
+        worker then awaits the follow-up's own outcome and delivers its
+        final reply directly (the busy handler already returned, so nothing
+        else will).
+        """
+        source = event.source
+        try:
+            # Same shared preprocessing pipeline as the normal inbound path
+            # (sender prefix, STT, media enrichment, reply context).
+            # Fail-open to the raw text: losing enrichment on a follow-up is
+            # better than dropping the message.
+            try:
+                message_text = await self._prepare_profile_scoped_inbound_message_text(
+                    event=event,
+                    source=source,
+                    history=[],
+                    session_key=session_key,
+                )
+            except Exception:
+                logger.warning(
+                    "Runtime delegation: follow-up preprocessing failed for %s; "
+                    "using raw text",
+                    session_key, exc_info=True,
+                )
+                message_text = event.text or ""
+            if message_text is None:
+                # Preprocessing consumed the event (e.g. media buffered for a
+                # later turn) — nothing to submit.
+                return
+
+            # Best-effort gateway session id (result-dict metadata only; the
+            # delegated turn persists in serve's stored session).
+            gw_session_id = ""
+            try:
+                _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                gw_session_id = getattr(_entry, "session_id", "") or ""
+            except Exception:
+                gw_session_id = ""
+
+            result = await self._run_turn_via_runtime(
+                message=message_text,
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id=gw_session_id,
+                session_key=session_key,
+                run_generation=None,
+                event_message_id=(
+                    str(event.message_id) if event.message_id else None
+                ),
+                channel_prompt=getattr(event, "channel_prompt", None),
+            )
+
+            final_text = str(result.get("final_response") or "")
+            if result.get("failed") and not final_text:
+                final_text = "⚠️ The follow-up request failed: {}".format(
+                    str(result.get("error") or "unknown error")[:300]
+                )
+            if not final_text or result.get("interrupted"):
+                return
+            if result.get("response_previewed"):
+                return  # already delivered by a streaming sink
+
+            adapter = self._adapter_for_source(source)
+            if not adapter:
+                logger.warning(
+                    "Runtime delegation: no adapter to deliver follow-up "
+                    "reply for %s",
+                    session_key,
+                )
+                return
+            reply_anchor = self._reply_anchor_for_event(event)
+            try:
+                thread_meta = self._thread_metadata_for_source(source, reply_anchor)
+            except Exception:
+                thread_meta = None
+            await adapter._send_with_retry(
+                chat_id=source.chat_id,
+                content=final_text,
+                reply_to=(
+                    reply_anchor
+                    if source.platform == Platform.TELEGRAM
+                    and source.chat_type == "dm"
+                    and source.thread_id
+                    else (
+                        None
+                        if source.platform == Platform.TELEGRAM and source.thread_id
+                        else event.message_id
+                    )
+                ),
+                metadata=thread_meta,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error(
+                "Runtime delegation: follow-up turn failed for %s",
+                session_key, exc_info=True,
+            )
+
     async def _run_agent_via_proxy(
         self,
         message: str,
@@ -18813,6 +19383,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        event: Optional["MessageEvent"] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -18822,6 +19393,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile's secret scope (never the process-global ``os.environ``). When
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
+
+        ``event`` (optional) is the triggering MessageEvent; the runtime
+        delegation seam consults ``event.internal`` so synthetic events never
+        become delegated serve turns.
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
@@ -18831,6 +19406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                event=event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -18842,6 +19418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                event=event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -18963,19 +19540,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        event: Optional["MessageEvent"] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
-        
+
         Returns the full result dict from run_conversation, including:
           - "final_response": str (the text to send back)
           - "messages": list (full conversation including tool calls)
           - "api_calls": int
           - "completed": bool
-        
+
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # ---- Runtime delegation: submit the turn to `hermes serve` ----
+        # (shared-session runtime). Checked BEFORE proxy mode so a
+        # delegate-enabled route never reaches the legacy HTTP proxy path.
+        # Internal/synthetic events (event.internal) are never delegated.
+        if self._runtime_delegate_enabled_for(source, event=event):
+            return await self._run_turn_via_runtime(
+                message=message,
+                context_prompt=context_prompt,
+                history=history,
+                source=source,
+                session_id=session_id,
+                session_key=session_key,
+                run_generation=run_generation,
+                event_message_id=event_message_id,
+                channel_prompt=channel_prompt,
+            )
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -22043,6 +22638,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
