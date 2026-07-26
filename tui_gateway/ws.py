@@ -307,6 +307,10 @@ async def handle_ws(ws: Any, authority: str = "desktop") -> None:
 
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
         transport.authority = authority
+        if authority == "desktop":
+            # Channel-origin turn lifecycle events broadcast to every desktop
+            # connection so an unopened Task still gets snapshot updates.
+            server.register_desktop_observer(transport)
 
         # The desktop app and dashboard chat reach the agent through this WS
         # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
@@ -437,6 +441,7 @@ async def handle_ws(ws: Any, authority: str = "desktop") -> None:
         reaped_sessions = 0
         detached_sessions = 0
         if transport is not None:
+            server.unregister_desktop_observer(transport)
             transport.close()
 
             # Reap sessions this transport owned (close_on_disconnect sidecar

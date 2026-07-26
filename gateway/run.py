@@ -17901,6 +17901,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _interrupt_delegated_runtime_turns(self, session_key: str) -> None:
+        """Directed interrupt for live runtime-delegated turns (design §10.2).
+
+        Targets each tracked handle with its turn id + runtime generation so
+        only OUR active turn stops; a queued follow-up is not the active turn
+        and serve answers 4033 (stale) — logged and ignored. The handle's
+        future resolves through the normal turn.interrupted event.
+        """
+        handles_map = getattr(self, "_runtime_turn_handles", None)
+        if not handles_map or not session_key:
+            return
+        handles = [h for h in list((handles_map.get(session_key) or {}).values()) if not h.future.done()]
+        if not handles:
+            return
+        try:
+            client = self._get_runtime_client()
+        except Exception:
+            logger.warning(
+                "Runtime delegation: no runtime client to interrupt turns for %s",
+                session_key,
+            )
+            return
+        for handle in handles:
+            try:
+                await client.request(
+                    "session.interrupt",
+                    {
+                        "session_id": handle.runtime_session_id,
+                        "turn_id": handle.turn_id,
+                        "runtime_generation": handle.runtime_generation,
+                    },
+                    timeout=15,
+                )
+                logger.info(
+                    "Runtime delegation: interrupted turn %s for %s",
+                    handle.turn_id, session_key,
+                )
+            except Exception as exc:
+                # 4033 = stale/not-active (e.g. a queued follow-up) — expected.
+                logger.info(
+                    "Runtime delegation: directed interrupt for turn %s not "
+                    "applied (%s)",
+                    handle.turn_id, exc,
+                )
+
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -17916,6 +17961,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
+        # Shared session runtime: a delegated turn executes inside `hermes
+        # serve`, not a local AIAgent — /stop must send a DIRECTED interrupt
+        # (turn id + runtime generation) or the model/tools keep running and
+        # keep writing shared history (design §10.2).
+        await self._interrupt_delegated_runtime_turns(session_key)
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(
@@ -18884,6 +18934,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             handle.stored_session_id or "?", handle.status or "?",
         )
 
+        # Track the live handle so /stop can send a DIRECTED interrupt to
+        # serve (turn id + runtime generation, design §10.2) — a delegated
+        # turn has no local AIAgent to interrupt.
+        handles_map = getattr(self, "_runtime_turn_handles", None)
+        if handles_map is None:
+            handles_map = {}
+            self._runtime_turn_handles = handles_map
+        if session_key:
+            handles_map.setdefault(session_key, {})[handle.turn_id] = handle
+
         try:
             # Generous per-turn budget matching inline turn budgets. shield()
             # keeps the handle future usable by the client on timeout.
@@ -18906,6 +18966,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except asyncio.CancelledError:
             raise
+        finally:
+            if session_key:
+                try:
+                    handles_map.get(session_key, {}).pop(handle.turn_id, None)
+                    if not handles_map.get(session_key):
+                        handles_map.pop(session_key, None)
+                except Exception:
+                    pass
 
         if not _run_still_current():
             logger.info(
@@ -19045,7 +19113,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_meta = self._thread_metadata_for_source(source, reply_anchor)
             except Exception:
                 thread_meta = None
-            await adapter._send_with_retry(
+            # Delivery-obligation ledger parity with the normal final-send
+            # path (base.py): durably record the reply BEFORE the platform
+            # send so a crash between completion and ACK redelivers on the
+            # next boot instead of silently losing the follow-up's output.
+            # Best-effort at every step — ledger trouble never blocks a send.
+            _obligation_id = None
+            try:
+                from gateway.delivery_ledger import (
+                    compute_obligation_id,
+                    ledger_enabled,
+                    mark_attempting,
+                    record_obligation,
+                )
+
+                if ledger_enabled():
+                    _obligation_id = compute_obligation_id(
+                        session_key,
+                        str(getattr(event, "message_id", "") or ""),
+                        final_text,
+                    )
+                    record_obligation(
+                        obligation_id=_obligation_id,
+                        session_key=session_key,
+                        platform=str(getattr(source.platform, "value", source.platform)),
+                        chat_id=source.chat_id,
+                        thread_id=getattr(source, "thread_id", None),
+                        content=final_text,
+                    )
+                    mark_attempting(_obligation_id)
+            except Exception:
+                logger.debug("delivery ledger record failed (follow-up)", exc_info=True)
+                _obligation_id = None
+            send_result = await adapter._send_with_retry(
                 chat_id=source.chat_id,
                 content=final_text,
                 reply_to=(
@@ -19061,6 +19161,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 metadata=thread_meta,
             )
+            if _obligation_id is not None:
+                try:
+                    from gateway.delivery_ledger import mark_delivered, mark_failed
+
+                    if getattr(send_result, "success", False):
+                        mark_delivered(_obligation_id)
+                    else:
+                        mark_failed(
+                            _obligation_id,
+                            str(getattr(send_result, "error", "") or ""),
+                        )
+                except Exception:
+                    logger.debug("delivery ledger update failed (follow-up)", exc_info=True)
         except asyncio.CancelledError:
             raise
         except Exception:

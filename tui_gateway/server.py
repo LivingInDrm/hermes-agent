@@ -1231,7 +1231,14 @@ def _session_event_targets(session: dict) -> list:
     state = session.get("turn_state")
     if isinstance(state, SessionTurnState):
         active = state.active
-        if active is not None and not is_terminal_turn_state(active.state):
+        # Deliberately include the sink of a TERMINAL active record too:
+        # _finish_active_turn marks the record terminal *before* emitting
+        # turn.completed/interrupted/failed, and that terminal event is
+        # exactly what the Gateway delivery sink is waiting on. The record
+        # (and its sink) is replaced when the next turn is promoted; until
+        # then, post-turn session events reaching the old sink are harmless —
+        # sinks filter by turn envelope.
+        if active is not None:
             sink = active.transport
             if sink is not None and all(sink is not t for t in targets):
                 targets.append(sink)
@@ -5823,6 +5830,39 @@ def _clear_inflight_turn(session: dict) -> None:
 
 _turn_dedup = GenerationDedupTable()
 
+# Desktop-authority 连接的进程级登记表：channel-origin 的 turn 生命周期事件
+# 会广播给所有 Desktop 连接（即使该 Session 没有任何 Desktop subscriber），
+# 让桌面在页面未打开时也能凭事件 envelope 的 lineage/stored ref 创建或刷新
+# Task snapshot（design §13.4）。mid-turn 流事件不广播——只有打开会话的
+# 订阅者才需要 delta。
+_desktop_observer_transports: "set" = set()
+
+
+def register_desktop_observer(transport) -> None:
+    if transport is not None:
+        _desktop_observer_transports.add(transport)
+
+
+def unregister_desktop_observer(transport) -> None:
+    _desktop_observer_transports.discard(transport)
+
+
+def _broadcast_channel_turn_event(kind: str, sid: str, payload: dict) -> None:
+    session = _sessions.get(sid)
+    already = {id(t) for t in _session_event_targets(session)} if session else set()
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"type": kind, "session_id": sid, "payload": payload},
+    }
+    for transport in list(_desktop_observer_transports):
+        if id(transport) in already:
+            continue
+        try:
+            transport.write(frame)
+        except Exception:
+            pass
+
 
 def _turn_state(session: dict) -> SessionTurnState:
     state = session.get("turn_state")
@@ -5869,6 +5909,8 @@ def _emit_turn_event(kind: str, sid: str, session: dict, record: TurnRecord, ext
     if extra:
         payload.update(extra)
     _emit(kind, sid, payload)
+    if record.origin == "channel":
+        _broadcast_channel_turn_event(kind, sid, payload)
 
 
 def _new_turn_record(
@@ -5983,15 +6025,20 @@ def _channel_platform_toolsets(platform: str) -> list | None:
         return None
 
 
-def _turn_dedup_key(record: TurnRecord, authority: str) -> tuple | None:
+def _turn_dedup_key(record: TurnRecord, authority: str | None = None) -> tuple | None:
     if not record.client_turn_id:
         return None
+    # The claim authority is a property of the record itself (its origin is
+    # credential-derived at submit time); deriving it here keeps claim and
+    # release symmetric — a queue-full release must free the SAME key the
+    # claim registered, or a retried client_turn_id hits a ghost record.
+    resolved = authority or ("gateway" if record.origin == "channel" else "desktop")
     return GenerationDedupTable.key(
-        record.profile, record.lineage_id, authority, record.client_turn_id
+        record.profile, record.lineage_id, resolved, record.client_turn_id
     )
 
 
-def _claim_turn_dedup(record: TurnRecord, authority: str = "desktop") -> TurnRecord | None:
+def _claim_turn_dedup(record: TurnRecord, authority: str | None = None) -> TurnRecord | None:
     """Atomically claim ``record`` in the generation-local dedup table.
 
     Returns the previously-claimed record on duplicate (the caller must
@@ -6007,7 +6054,7 @@ def _claim_turn_dedup(record: TurnRecord, authority: str = "desktop") -> TurnRec
     return _turn_dedup.claim(key, record)
 
 
-def _release_turn_dedup(record: TurnRecord, authority: str = "desktop") -> None:
+def _release_turn_dedup(record: TurnRecord, authority: str | None = None) -> None:
     key = _turn_dedup_key(record, authority)
     if key is not None:
         _turn_dedup.release(key)
@@ -10131,7 +10178,7 @@ def _(rid, params: dict) -> dict:
         execution_hints=(channel_turn or {}).get("execution_hints"),
         delivery_sink_id=(channel_turn or {}).get("delivery_sink_id"),
     )
-    duplicate = _claim_turn_dedup(record, authority="gateway" if channel_turn else "desktop")
+    duplicate = _claim_turn_dedup(record)
     if duplicate is not None:
         return _duplicate_turn_response(rid, session, duplicate)
     while True:

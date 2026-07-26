@@ -195,3 +195,84 @@ def test_disconnect_cleans_subscriptions(server):
     assert session["subscribers"] == {}
     # The primary transport is untouched by an observer disconnect.
     assert session["transport"] is primary
+
+
+def test_terminal_turn_event_still_reaches_gateway_sink(server):
+    """turn.completed/interrupted/failed are emitted AFTER the record flips
+    terminal — the sink must still receive them (it is exactly what the
+    Gateway delivery leg awaits); regression for the 1800s-timeout bug."""
+    primary = _FakeTransport("desktop")
+    sink = _FakeTransport("gateway")
+    session = _session(server, "sid-term", transport=primary)
+    _activate_channel_turn(server, session, sink)
+
+    server._finish_active_turn("sid-term", session, "completed")
+
+    kinds = [f["params"]["type"] for f in sink.frames]
+    assert kinds == ["turn.completed"], kinds
+    assert [f["params"]["type"] for f in primary.frames] == ["turn.completed"]
+
+
+def test_channel_queue_full_release_frees_gateway_authority_claim(server, monkeypatch):
+    """Queue-full must release the dedup claim under the SAME authority the
+    claim used (gateway for channel-origin) — otherwise a retried
+    client_turn_id hits a ghost record that never entered the queue."""
+    from tui_gateway.turn_fifo import TURN_QUEUE_MAX_PENDING, GenerationDedupTable
+
+    monkeypatch.setattr(server, "_turn_dedup", GenerationDedupTable())
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    session = _session(server, "sid-cq", transport=_FakeTransport("desktop"), running=True)
+    sink = _FakeTransport("gateway")
+
+    def _channel_record(text, client_id=""):
+        return server._new_turn_record(
+            session, text, sequence=0, origin="channel",
+            delivery_mode="origin-channel", client_turn_id=client_id, transport=sink,
+        )
+
+    for index in range(TURN_QUEUE_MAX_PENDING):
+        assert server._handle_busy_submit("r", "sid-cq", session, _channel_record(f"m{index}"))["result"]["status"] == "queued"
+
+    rejected = _channel_record("retry me", client_id="chan-client-1")
+    assert server._claim_turn_dedup(rejected) is None
+    overflow = server._handle_busy_submit("r-full", "sid-cq", session, rejected)
+    assert overflow["error"]["code"] == 4290
+
+    # 腾出空位后，同一 client_turn_id 的重试必须能真正入队（而不是命中
+    # 从未入队的幽灵 duplicate）。
+    with session["history_lock"]:
+        session["turn_state"].queue.popleft()
+    retry = _channel_record("retry me", client_id="chan-client-1")
+    assert server._claim_turn_dedup(retry) is None
+    accepted = server._handle_busy_submit("r-retry", "sid-cq", session, retry)
+    assert accepted["result"]["status"] == "queued"
+
+
+def test_channel_turn_lifecycle_broadcasts_to_desktop_observers(server):
+    """channel-origin 的 turn 生命周期事件广播给所有 desktop 连接（即使该
+    Session 没有任何订阅者），桌面据此在页面未打开时创建/刷新 Task snapshot；
+    desktop-origin turn 不广播。"""
+    desktop = _FakeTransport("desktop-anywhere")
+    server.register_desktop_observer(desktop)
+    try:
+        gateway_sink = _FakeTransport("gateway")
+        session = _session(server, "sid-bcast", transport=gateway_sink, session_key="chan-tip")
+        record = _activate_channel_turn(server, session, gateway_sink)
+        server._emit_turn_event("turn.started", "sid-bcast", session, record)
+
+        kinds = [f["params"]["type"] for f in desktop.frames]
+        assert kinds == ["turn.started"]
+        payload = desktop.frames[0]["params"]["payload"]
+        assert payload["stored_session_id"] == "chan-tip"
+        assert payload["lineage_id"]
+        assert payload["origin"] == "channel"
+
+        # desktop-origin turn：不广播（打开会话的订阅者才收流）。
+        session2 = _session(server, "sid-desk", transport=_FakeTransport("p2"))
+        record2 = server._new_turn_record(session2, "x", sequence=1)
+        with session2["history_lock"]:
+            server._turn_state(session2).activate(record2)
+        server._emit_turn_event("turn.started", "sid-desk", session2, record2)
+        assert len(desktop.frames) == 1
+    finally:
+        server.unregister_desktop_observer(desktop)

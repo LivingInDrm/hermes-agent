@@ -89,7 +89,7 @@ class RuntimeTurnHandle:
     stored_session_id: str = ""
     lineage_id: str = ""
     runtime_session_id: str = ""
-    runtime_generation: int = 0
+    runtime_generation: str = ""
     queue_position: int = 0
     duplicate: bool = False
     status: str = ""
@@ -339,7 +339,9 @@ class GatewayRuntimeClient:
             stored_session_id=str(result.get("stored_session_id") or ""),
             lineage_id=str(result.get("lineage_id") or ""),
             runtime_session_id=str(result.get("runtime_session_id") or ""),
-            runtime_generation=int(result.get("runtime_generation") or 0),
+            # RUNTIME_GENERATION is an opaque uuid hex string on the serve
+            # side — never coerce to int (a real response would raise).
+            runtime_generation=str(result.get("runtime_generation") or ""),
             queue_position=int(result.get("queue_position") or 0),
             duplicate=bool(result.get("duplicate")),
             status=str(result.get("status") or ""),

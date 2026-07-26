@@ -197,7 +197,7 @@ def _submit_result(**overrides):
         "lineage_id": "lin-1",
         "stored_session_id": "stored-9",
         "runtime_session_id": "rt-1",
-        "runtime_generation": 2,
+        "runtime_generation": "5363e55bba1741cfb7cab44b09b2b22c",
         "status": "streaming",
     }
     result.update(overrides)
@@ -210,7 +210,7 @@ def _turn_key(turn_id="t-1"):
         "sequence": 3,
         "origin": "channel",
         "delivery_mode": "origin-channel",
-        "runtime_generation": 2,
+        "runtime_generation": "5363e55bba1741cfb7cab44b09b2b22c",
     }
 
 
@@ -883,3 +883,86 @@ class TestRunAgentRuntimeDispatch:
             pass  # Expected — bare runner can't run the real inline path.
 
         assert fake.submitted == []
+
+
+class TestServerShapedWireContract:
+    """Wire-contract guard: the fake responses above must stay shaped like a
+    REAL serve response — runtime_generation is `uuid4().hex` (an opaque
+    string, usually non-numeric). Regression for the int() coercion that made
+    every real submit fail with ValueError while numeric test fixtures
+    stayed green."""
+
+    @pytest.mark.asyncio
+    async def test_submit_accepts_uuid_hex_runtime_generation(self, monkeypatch):
+        client = GatewayRuntimeClient("ws://127.0.0.1:1/api/ws", "tok")
+        fake_ws = _FakeWS()
+        client._ws = fake_ws
+
+        async def _noop():
+            return None
+
+        monkeypatch.setattr(client, "ensure_connected", _noop)
+        submit_task = asyncio.create_task(
+            client.submit_turn({"client_turn_id": "c-1", "message": "hi"})
+        )
+        await asyncio.sleep(0)
+        frame = fake_ws.sent[0]
+        client.handle_frame({
+            "jsonrpc": "2.0",
+            "id": frame["id"],
+            "result": _submit_result(),
+        })
+        handle = await submit_task
+        assert handle.runtime_generation == "5363e55bba1741cfb7cab44b09b2b22c"
+        assert isinstance(handle.runtime_generation, str)
+        # int(uuid_hex) raises — the client must never coerce.
+        with pytest.raises(ValueError):
+            int(handle.runtime_generation)
+
+
+class TestDelegatedStopInterrupt:
+    """/stop on a delegated route must send a DIRECTED session.interrupt to
+    serve (turn id + runtime generation) — there is no local AIAgent to
+    interrupt, and without this the model/tools keep running (§10.2)."""
+
+    @pytest.mark.asyncio
+    async def test_interrupt_delegated_runtime_turns_sends_directed_interrupt(self):
+        from types import SimpleNamespace
+
+        from gateway.run import GatewayRunner
+
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        handle = SimpleNamespace(
+            turn_id="t-9",
+            runtime_session_id="rt-9",
+            runtime_generation="5363e55bba1741cfb7cab44b09b2b22c",
+            future=pending,
+        )
+        requests = []
+
+        class _FakeClient:
+            async def request(self, method, params, timeout=30):
+                requests.append((method, params))
+                return {"status": "interrupted"}
+
+        runner = SimpleNamespace(
+            _runtime_turn_handles={"sess-key": {"t-9": handle}},
+            _get_runtime_client=lambda: _FakeClient(),
+        )
+        await GatewayRunner._interrupt_delegated_runtime_turns(runner, "sess-key")
+
+        assert requests == [(
+            "session.interrupt",
+            {
+                "session_id": "rt-9",
+                "turn_id": "t-9",
+                "runtime_generation": "5363e55bba1741cfb7cab44b09b2b22c",
+            },
+        )]
+
+        # Resolved handles are skipped — no stray interrupts after completion.
+        requests.clear()
+        pending.set_result({"state": "completed"})
+        await GatewayRunner._interrupt_delegated_runtime_turns(runner, "sess-key")
+        assert requests == []
