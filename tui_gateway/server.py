@@ -898,6 +898,14 @@ def _close_sessions_for_transport(
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+        observed = [s for s in _sessions.values() if isinstance(s.get("subscribers"), dict)]
+    # Observer subscriptions die with their transport — they never keep a
+    # session alive and never migrate to another socket (design §9.2).
+    for session in observed:
+        subscribers = session.get("subscribers") or {}
+        stale = [key for key, sub in subscribers.items() if sub is transport]
+        for key in stale:
+            subscribers.pop(key, None)
     reaped = 0
     detached = 0
     for sid, session in owned:
@@ -1204,14 +1212,45 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _session_event_targets(session: dict) -> list:
+    """Every transport that observes this session's events (design §9).
+
+    - the session's primary transport (historical single-owner routing);
+    - the active turn's submitting transport — the per-turn sink: a
+      channel-origin turn streams back to the Gateway Runtime Client that
+      submitted it even while a Desktop client holds the primary transport;
+    - registered subscribers (Desktop observers via session.subscribe that
+      must not steal anyone's reply route).
+
+    Deduplicated by object identity; order = primary first.
+    """
+    targets = []
+    primary = session.get("transport")
+    if primary is not None:
+        targets.append(primary)
+    state = session.get("turn_state")
+    if isinstance(state, SessionTurnState):
+        active = state.active
+        if active is not None and not is_terminal_turn_state(active.state):
+            sink = active.transport
+            if sink is not None and all(sink is not t for t in targets):
+                targets.append(sink)
+    subscribers = session.get("subscribers")
+    if isinstance(subscribers, dict):
+        for subscriber in subscribers.values():
+            if subscriber is not None and all(subscriber is not t for t in targets):
+                targets.append(subscriber)
+    return targets
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
     Precedence:
 
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+    1. Event frames with a session id → every transport observing that
+       session (primary + active turn sink + subscribers). The return value
+       reflects the primary write; secondary deliveries are best-effort.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -1219,8 +1258,16 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+        if sid and (session := _sessions.get(sid)) is not None:
+            targets = _session_event_targets(session)
+            if targets:
+                ok = targets[0].write(obj)
+                for extra in targets[1:]:
+                    try:
+                        extra.write(obj)
+                    except Exception:
+                        pass
+                return ok
 
     return (current_transport() or _stdio_transport).write(obj)
 
@@ -1229,6 +1276,23 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     params = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
+    # Attribute mid-turn events (message.delta, tool.*, …) to the active turn
+    # so multi-consumer clients (Desktop observer, Gateway delivery sink) can
+    # associate the stream with a turn without guessing (design §7.5/§9.2).
+    # Additive sibling key — payload shapes stay untouched.
+    session = _sessions.get(sid)
+    if session is not None:
+        state = session.get("turn_state")
+        if isinstance(state, SessionTurnState):
+            active = state.active
+            if active is not None and not is_terminal_turn_state(active.state):
+                params["turn"] = {
+                    "turn_id": active.turn_id,
+                    "sequence": active.sequence,
+                    "origin": active.origin,
+                    "delivery_mode": active.delivery_mode,
+                    "runtime_generation": RUNTIME_GENERATION,
+                }
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 
 
@@ -1630,7 +1694,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 kw = {"session_db": session_db}
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
-                kw["platform_override"] = _session_source(current)
+                kw["platform_override"] = current.get("_executor_platform") or _session_source(current)
                 resume_overrides = current.get("resume_runtime_overrides")
                 if isinstance(resume_overrides, dict) and resume_overrides:
                     # Cold deferred resume: restore the full persisted runtime
@@ -1649,6 +1713,25 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                # Channel-origin executor context (shared session runtime):
+                # gateway-authenticated ephemeral prompt and allowlisted
+                # one-shot hints override the desktop-side defaults.
+                executor_platform = current.get("_executor_platform")
+                if executor_platform and executor_platform != "desktop":
+                    kw["channel_platform"] = executor_platform
+                if ephemeral := current.get("_executor_ephemeral_prompt"):
+                    kw["ephemeral_prompt_override"] = str(ephemeral)
+                hints = current.get("_executor_hints") or {}
+                if isinstance(hints, dict) and hints:
+                    if hints.get("model"):
+                        hint_override = {"model": str(hints["model"])}
+                        if hints.get("provider"):
+                            hint_override["provider"] = str(hints["provider"])
+                        kw["model_override"] = hint_override
+                    if hints.get("reasoning_effort"):
+                        kw["reasoning_config_override"] = {"effort": str(hints["reasoning_effort"])}
+                    if hints.get("service_tier"):
+                        kw["service_tier_override"] = str(hints["service_tier"])
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -5113,6 +5196,8 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    channel_platform: str | None = None,
+    ephemeral_prompt_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5147,6 +5232,10 @@ def _make_agent(
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
     system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
+    if ephemeral_prompt_override:
+        # Channel-origin executor: the Gateway-prepared channel prompt owns
+        # the ephemeral system prompt for this executor (design §7.6).
+        system_prompt = ephemeral_prompt_override
     startup_skills = _parse_tui_skills_env()
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
@@ -5265,7 +5354,11 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=(
+            _channel_platform_toolsets(channel_platform) or _load_enabled_toolsets()
+            if channel_platform
+            else _load_enabled_toolsets()
+        ),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -5838,6 +5931,58 @@ def _finish_active_turn(sid: str, session: dict, outcome: str | None = None) -> 
     _emit_turn_event(f"turn.{record.state}", sid, session, record)
 
 
+def _prepare_turn_executor(sid: str, session: dict, record: TurnRecord) -> None:
+    """Serialize executor identity to the turn about to run (design §7.6).
+
+    The Python AIAgent object is a cache keyed by the execution signature
+    (origin + trusted channel user + ephemeral prompt + one-shot hints).
+    Adjacent turns with the same signature reuse it; a signature change tears
+    the agent down so ``_start_agent_build`` rebuilds it with this turn's
+    platform/toolsets/prompt — Desktop-origin turns never inherit Channel
+    toolsets and vice versa. History and session identity are untouched
+    (this is NOT /new).
+    """
+    trusted = record.trusted_source or {}
+    signature = (
+        record.origin,
+        str(trusted.get("user_id") or ""),
+        str(record.ephemeral_prompt or ""),
+        json.dumps(record.execution_hints or {}, sort_keys=True),
+    )
+    with session["history_lock"]:
+        previous = session.get("_executor_signature")
+        if previous == signature and session.get("agent") is not None:
+            return
+        session["_executor_signature"] = signature
+        session["_executor_platform"] = (
+            _session_source(session) if record.origin == "channel" else "desktop"
+        )
+        session["_executor_ephemeral_prompt"] = record.ephemeral_prompt or None
+        session["_executor_hints"] = dict(record.execution_hints or {})
+        session["_executor_trusted_source"] = dict(trusted) if trusted else None
+        if previous is None or session.get("agent") is None:
+            return
+        # Serial rebuild boundary: the previous turn has completed (FIFO), so
+        # discarding the cached executor here is safe.
+        session["agent"] = None
+        session["agent_build_started"] = False
+        session["agent_ready"] = threading.Event()
+
+
+def _channel_platform_toolsets(platform: str) -> list | None:
+    """Channel-origin executors resolve the platform's configured toolsets
+    (mirrors the Messaging Gateway's `_get_platform_tools`), never the
+    desktop/TUI toolset selection (design §7.6)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.tools_config import _get_platform_tools
+
+        return sorted(_get_platform_tools(load_config_readonly(), platform))
+    except Exception:
+        logger.debug("platform toolset resolution failed for %s", platform, exc_info=True)
+        return None
+
+
 def _turn_dedup_key(record: TurnRecord, authority: str) -> tuple | None:
     if not record.client_turn_id:
         return None
@@ -6008,6 +6153,18 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         state = _turn_state(session)
         if session.get("running"):
             return False
+        head = state.queue[0] if state.queue else None
+        if (
+            head is not None
+            and head.origin == "channel"
+            and head.transport is not None
+            and _transport_is_dead(head.transport)
+        ):
+            # The Gateway delivery sink is gone: never start a Channel-origin
+            # turn whose output cannot be delivered (design §5.6). The session
+            # FIFO pauses here; the Runtime Unit owner converges the whole
+            # Unit (gateway exit → unit failed → serve stops) shortly after.
+            return False
         record = state.promote_next()
         if record is None:
             return False
@@ -6017,12 +6174,28 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if record.attachments:
             session["attached_images"] = list(record.attachments) + list(session.get("attached_images") or [])
         _start_inflight_turn(session, record.text)
-        # Legacy single-transport routing: the drained turn streams back to
-        # the client that submitted it (removed once multi-subscriber event
-        # routing lands).
-        if record.transport is not None:
+        # Desktop/TUI turns keep the historical primary-transport rebind so
+        # the drained turn streams to the client that submitted it. A
+        # channel-origin turn must NOT steal the primary transport: its
+        # submitting transport already acts as the per-turn delivery sink
+        # (write_json fans out to it while the turn is active) and Desktop
+        # observers keep their own route (design §9.2).
+        if record.transport is not None and record.origin != "channel":
             session["transport"] = record.transport
     _emit_turn_event("turn.started", sid, session, record)
+    _prepare_turn_executor(sid, session, record)
+    if session.get("agent") is None and not _session_uses_compute_host(session):
+        # Signature change or cold session: rebuild the executor serially
+        # before dispatching this turn (design §7.6).
+        _start_agent_build(sid, session)
+        if (err := _wait_agent(session, rid)) is not None:
+            message = str(((err.get("error") or {}).get("message")) or "agent initialization failed")
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            _emit("error", sid, {"message": message})
+            _finish_active_turn(sid, session, "failed")
+            return True
     try:
         if _session_uses_compute_host(session):
             resp = _submit_prompt_to_compute_host(rid, sid, session, record.text)
@@ -7189,6 +7362,53 @@ def _(rid, params: dict) -> dict:
             transport=current_transport() or _stdio_transport,
         ),
     )
+
+
+@method("session.subscribe")
+def _(rid, params: dict) -> dict:
+    """Register the calling transport as an OBSERVER of a live session.
+
+    Unlike ``session.activate`` this never rebinds the session's primary
+    transport and never touches anyone's reply sink: a Desktop window watching
+    a Channel conversation receives every event without stealing the Gateway's
+    delivery route (design §9.1/§9.2). Subscriptions are connection-scoped and
+    die with the transport; they are process-local and do not survive a
+    runtime generation change.
+
+    Returns the same live snapshot as ``session.activate`` so the subscriber
+    can render current state (messages / inflight / queued turns) before the
+    next event arrives.
+    """
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4034, "session.subscribe requires a connection-bound transport")
+    subscribers = session.get("subscribers")
+    if not isinstance(subscribers, dict):
+        subscribers = {}
+        session["subscribers"] = subscribers
+    subscription_id = f"sub-{uuid.uuid4().hex[:12]}"
+    subscribers[subscription_id] = transport
+    payload = _live_session_payload(sid, session, touch=False, transport=None)
+    payload["subscription_id"] = subscription_id
+    return _ok(rid, payload)
+
+
+@method("session.unsubscribe")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    subscription_id = str(params.get("subscription_id") or "")
+    subscribers = session.get("subscribers")
+    removed = False
+    if isinstance(subscribers, dict):
+        removed = subscribers.pop(subscription_id, None) is not None
+    return _ok(rid, {"removed": removed})
 
 
 @method("session.delete")
@@ -9874,22 +10094,44 @@ def _(rid, params: dict) -> dict:
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+    # or fallback moved the session transport to stdio. The Gateway Runtime
+    # Client is a per-turn delivery sink, never the session's primary
+    # transport — Desktop observers keep their route (design §9.2).
+    t = current_transport()
+    if t is not None and getattr(t, "authority", "") == "gateway-service":
+        t_primary = None
+    else:
+        t_primary = t
+    if t_primary is not None:
+        session["transport"] = t_primary
     # Allocate the turn identity and claim generation-local dedup BEFORE the
     # busy/idle race: a retried client_turn_id must answer with the original
     # turn instead of creating a second one (design §8.3). The lineage lookup
     # happens here, outside history_lock.
     client_turn_id = str(params.get("client_turn_id") or "")
+    # Channel execution context rides in only on the Gateway Runtime Client
+    # authority (turn.submit delegation); a desktop credential can never
+    # smuggle a trusted channel identity (design §5.2/§7.2).
+    channel_turn = None
+    if getattr(current_transport(), "authority", "") == "gateway-service":
+        raw_channel = params.get("_channel_turn")
+        if isinstance(raw_channel, dict):
+            channel_turn = raw_channel
     record = _new_turn_record(
         session,
         text,
         sequence=0,
         client_turn_id=client_turn_id,
         transport=t or session.get("transport"),
+        origin="channel" if channel_turn is not None else "desktop",
+        delivery_mode=str((channel_turn or {}).get("delivery_mode") or "desktop-only"),
+        trusted_source=(channel_turn or {}).get("trusted_source"),
+        ephemeral_prompt=(channel_turn or {}).get("ephemeral_prompt"),
+        auto_skills=(channel_turn or {}).get("auto_skills"),
+        execution_hints=(channel_turn or {}).get("execution_hints"),
+        delivery_sink_id=(channel_turn or {}).get("delivery_sink_id"),
     )
-    duplicate = _claim_turn_dedup(record)
+    duplicate = _claim_turn_dedup(record, authority="gateway" if channel_turn else "desktop")
     if duplicate is not None:
         return _duplicate_turn_response(rid, session, duplicate)
     while True:
@@ -9950,6 +10192,7 @@ def _(rid, params: dict) -> dict:
 
     _emit_turn_event("turn.enqueued", sid, session, record, {"queue_position": 0})
     _emit_turn_event("turn.started", sid, session, record)
+    _prepare_turn_executor(sid, session, record)
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
@@ -9970,6 +10213,10 @@ def _(rid, params: dict) -> dict:
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
+    # Channel conversations stamp their routing peer identity onto the row so
+    # (profile, source, source_session_key) resolve-or-create stays stable
+    # across gateway restarts and lost routing indexes (design §7.2).
+    _stamp_channel_peer(session)
     # A branch becomes real here: copy its parent's transcript into the row so it
     # resumes with full context (the agent won't persist the seed itself).
     _persist_branch_seed(session)
@@ -10067,6 +10314,87 @@ def _resolve_turn_session(rid, stored_id: str):
     return resumed_sid, session
 
 
+def _resolve_channel_conversation(rid, source: str, source_session_key: str):
+    """Resolve-or-create the Channel conversation for a trusted opaque key.
+
+    The same ``(profile, source, source_session_key)`` must always converge on
+    one lineage — concurrent or crash-retried submits included (design §7.2).
+    Resolution order: durable peer row (sessions.session_key column, the same
+    index the Messaging Gateway's recovery uses) → canonical tip → live actor;
+    otherwise create a fresh session carrying the platform source. The peer
+    identity is stamped onto the durable row at first persist so a later
+    routing loss can rebuild the mapping.
+    """
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5000)
+    row = None
+    try:
+        row = db.find_latest_gateway_session_for_peer(
+            source=source, session_key=source_session_key
+        )
+    except Exception:
+        row = None
+    if row and row.get("id"):
+        resolved = _resolve_turn_session(rid, str(row["id"]))
+        if isinstance(resolved, dict):
+            return resolved
+        sid, session = resolved
+        session.setdefault("_channel_peer", {"source": source, "session_key": source_session_key})
+        return sid, session
+    create_resp = _methods["session.create"](rid, {
+        "source": source,
+        "close_on_disconnect": False,
+    })
+    if create_resp.get("error"):
+        return create_resp
+    created_sid = str((create_resp.get("result") or {}).get("session_id") or "")
+    with _sessions_lock:
+        session = _sessions.get(created_sid)
+    if session is None:
+        return _err(rid, 5000, "channel session vanished before turn dispatch")
+    session["_channel_peer"] = {"source": source, "session_key": source_session_key}
+    return created_sid, session
+
+
+def _stamp_channel_peer(session: dict) -> None:
+    """Persist the channel routing peer onto the durable session row (once)."""
+    peer = session.get("_channel_peer")
+    if not isinstance(peer, dict) or session.get("_channel_peer_stamped"):
+        return
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        db.record_gateway_session_peer(
+            str(session.get("session_key") or ""),
+            source=str(peer.get("source") or ""),
+            session_key=str(peer.get("session_key") or ""),
+        )
+        session["_channel_peer_stamped"] = True
+    except Exception:
+        logger.debug("channel peer stamp failed", exc_info=True)
+
+
+_EXECUTION_HINT_ALLOWLIST = frozenset({
+    "model", "provider", "reasoning_effort", "service_tier", "max_iterations",
+})
+
+
+def _filter_execution_hints(raw) -> dict | None:
+    """Allowlisted, non-secret one-shot overrides only (design §7.2): never an
+    API key, base URL, or arbitrary tool name."""
+    if not isinstance(raw, dict):
+        return None
+    hints = {}
+    for key, value in raw.items():
+        if key not in _EXECUTION_HINT_ALLOWLIST:
+            continue
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            hints[key] = str(value).strip() if isinstance(value, str) else value
+    return hints or None
+
+
 @method("turn.submit")
 def _(rid, params: dict) -> dict:
     """Transport-neutral turn submission (shared session runtime, design §7).
@@ -10097,27 +10425,63 @@ def _(rid, params: dict) -> dict:
     conversation = params.get("conversation") or {}
     kind = str(conversation.get("kind") or "stored")
     # Origin/authority derive from the entry credential, never the payload
-    # (design §5.2). The /api/ws dashboard socket is the desktop authority;
-    # channel-create, trusted_source and origin-channel delivery arrive with
-    # the M3 Gateway Runtime Client.
-    if kind != "stored":
-        return _err(rid, 4031, "conversation.kind requires the gateway runtime client (not enabled)")
-    if delivery_mode != "desktop-only" or params.get("trusted_source") or params.get("delivery_sink_id"):
-        return _err(rid, 4031, "channel delivery requires the gateway runtime client (not enabled)")
-    stored_id = str(conversation.get("stored_session_id") or "")
-    if not stored_id:
-        return _err(rid, 4032, "conversation.stored_session_id required")
+    # (design §5.2): the dashboard token/ticket is the desktop authority;
+    # the per-Unit service credential marks the Gateway Runtime Client.
+    authority = getattr(current_transport(), "authority", "desktop")
+    if authority == "gateway-service":
+        # Gateway entry: origin=channel is forced, replies go to the origin
+        # channel, and the trusted execution context is accepted (§7.2).
+        if delivery_mode != "origin-channel":
+            return _err(rid, 4032, "gateway submits must use delivery_mode origin-channel")
+        trusted_source = params.get("trusted_source")
+        if trusted_source is not None and not isinstance(trusted_source, dict):
+            return _err(rid, 4032, "invalid trusted_source")
+        channel_turn = {
+            "delivery_mode": "origin-channel",
+            "trusted_source": trusted_source,
+            "ephemeral_prompt": str(params.get("ephemeral_prompt") or "") or None,
+            "auto_skills": params.get("auto_skills") if isinstance(params.get("auto_skills"), list) else None,
+            "execution_hints": _filter_execution_hints(params.get("execution_hints")),
+            "delivery_sink_id": str(params.get("delivery_sink_id") or "") or None,
+        }
+        if kind == "channel-create":
+            source = str(conversation.get("source") or "").strip()
+            source_session_key = str(conversation.get("source_session_key") or "").strip()
+            if not source or not source_session_key:
+                return _err(rid, 4032, "channel-create requires source and source_session_key")
+            resolved = _resolve_channel_conversation(rid, source, source_session_key)
+        elif kind == "stored":
+            stored_id = str(conversation.get("stored_session_id") or "")
+            if not stored_id:
+                return _err(rid, 4032, "conversation.stored_session_id required")
+            resolved = _resolve_turn_session(rid, stored_id)
+        else:
+            return _err(rid, 4032, f"unknown conversation.kind: {kind}")
+    else:
+        # Desktop entry: desktop-only delivery is forced; a desktop credential
+        # cannot construct a trusted channel context or a channel conversation.
+        if kind != "stored":
+            return _err(rid, 4031, "conversation.kind requires the gateway runtime client")
+        if delivery_mode != "desktop-only" or params.get("trusted_source") or params.get("delivery_sink_id"):
+            return _err(rid, 4031, "channel delivery requires the gateway runtime client")
+        channel_turn = None
+        stored_id = str(conversation.get("stored_session_id") or "")
+        if not stored_id:
+            return _err(rid, 4032, "conversation.stored_session_id required")
+        resolved = _resolve_turn_session(rid, stored_id)
 
-    resolved = _resolve_turn_session(rid, stored_id)
     if isinstance(resolved, dict):
         return resolved
     sid, session = resolved
 
-    resp = _methods["prompt.submit"](rid, {
+    delegate_params = {
         "session_id": sid,
         "text": raw_text,
         "client_turn_id": client_turn_id,
-    })
+    }
+    if channel_turn is not None:
+        delegate_params["_channel_turn"] = channel_turn
+    resp = _methods["prompt.submit"](rid, delegate_params)
     if resp.get("error"):
         return resp
     result = dict(resp.get("result") or {})

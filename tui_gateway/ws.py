@@ -280,8 +280,15 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+async def handle_ws(ws: Any, authority: str = "desktop") -> None:
+    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
+
+    ``authority`` tags the transport with the credential class that
+    authenticated this connection ("desktop" dashboard token/ticket vs
+    "gateway-service" — the Messaging Gateway Runtime Client). RPC handlers
+    read it via ``current_transport().authority`` to derive turn origin and
+    channel powers; it never comes from payload fields (design §5.2).
+    """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -299,6 +306,7 @@ async def handle_ws(ws: Any) -> None:
         _log.info("ws accepted peer=%s", peer)
 
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        transport.authority = authority
 
         # The desktop app and dashboard chat reach the agent through this WS
         # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
