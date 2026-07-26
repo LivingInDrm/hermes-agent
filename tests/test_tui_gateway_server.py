@@ -239,7 +239,12 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
                 "params": {"session_id": "iso-sid", "text": "hello"},
             }
         )
-        assert resp["result"] == {"status": "streaming", "turn_isolation": True}
+        assert resp["result"]["status"] == "streaming"
+        assert resp["result"]["turn_isolation"] is True
+        # Shared session runtime: the accept response carries the turn identity.
+        assert resp["result"]["turn_id"]
+        assert resp["result"]["sequence"] >= 1
+        assert resp["result"]["runtime_generation"] == server.RUNTIME_GENERATION
         assert fake_supervisor.frames[0]["type"] == "turn.start"
         assert fake_supervisor.frames[0]["sid"] == "iso-sid"
         assert fake_supervisor.frames[0]["text"] == "hello"
@@ -311,11 +316,10 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     finally:
         server._sessions.pop("iso-fallback", None)
 
-    assert resp == {
-        "jsonrpc": "2.0",
-        "id": "fallback-turn",
-        "result": {"status": "streaming"},
-    }
+    assert resp["id"] == "fallback-turn"
+    assert resp["result"]["status"] == "streaming"
+    assert resp["result"]["turn_id"]
+    assert resp["result"]["runtime_generation"] == server.RUNTIME_GENERATION
     assert inline_calls == [("fallback-turn", "iso-fallback", "hello")]
     assert session.get("_compute_host_active") is not True
 
@@ -531,7 +535,21 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
         finally:
             server._sessions.pop("sid", None)
 
-    assert run_flag_on() == run_flag_off()
+    events_on = run_flag_on()
+    events_off = run_flag_off()
+
+    def _visible(events):
+        # turn.* lifecycle events carry per-run uuids (turn_id); the golden
+        # equality is about the user-visible message/session transcript.
+        return [e for e in events if not str(e[0]).startswith("turn.")]
+
+    def _turn_kinds(events):
+        return [e[0] for e in events if str(e[0]).startswith("turn.")]
+
+    assert _visible(events_on) == _visible(events_off)
+    # Both dispatch paths announce the same turn lifecycle.
+    assert _turn_kinds(events_off) == ["turn.enqueued", "turn.started", "turn.completed"]
+    assert _turn_kinds(events_on) == ["turn.enqueued", "turn.started", "turn.completed"]
 
 
 def test_session_context_explicit_cwd_for_ephemeral_task(monkeypatch, tmp_path):
@@ -7259,7 +7277,8 @@ def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
 
 
 def test_interrupt_drops_queued_prompt_for_session():
-    """Explicit stop cancels a queued next turn instead of auto-draining it."""
+    """Explicit un-scoped stop cancels queued next turns instead of
+    auto-draining them (legacy /stop semantics over the turn FIFO)."""
     calls = {"interrupted": False}
 
     class _LiveThread:
@@ -7271,10 +7290,13 @@ def test_interrupt_drops_queued_prompt_for_session():
             interrupt=lambda: calls.__setitem__("interrupted", True)
         ),
         running=True,
-        queued_prompt={"text": "next prompt", "transport": None},
         _run_thread=_LiveThread(),
     )
     server._sessions["sid"] = session
+    queued_record = server._new_turn_record(session, "next prompt", sequence=0)
+    with session["history_lock"]:
+        queued_record.sequence = server._turn_state(session).next_sequence()
+        server._turn_state(session).enqueue(queued_record)
 
     try:
         resp = server.handle_request(
@@ -7283,7 +7305,8 @@ def test_interrupt_drops_queued_prompt_for_session():
 
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert calls["interrupted"] is True
-        assert session.get("queued_prompt") is None
+        assert len(session["turn_state"].queue) == 0
+        assert queued_record.state == "interrupted"
     finally:
         server._sessions.pop("sid", None)
 
@@ -8616,7 +8639,8 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     server._sessions["sid-live"] = session
     try:
         queued = server._handle_busy_submit(
-            "submit", "sid-live", session, "newest prompt", object()
+            "submit", "sid-live", session,
+            server._new_turn_record(session, "newest prompt", sequence=0, transport=object()),
         )
         assert queued["result"]["status"] == "queued"
 
