@@ -4796,6 +4796,15 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)
     _guard_existing_gateway_process_conflict(replace=replace)
+    # Externally supervised foreground gateway (Desktop Runtime Unit): die
+    # with the declared parent so a force-killed supervisor never leaves an
+    # orphan dispatcher (HERMES_PARENT_PID; no-op otherwise).
+    try:
+        from hermes_cli.parent_liveness import start_parent_liveness_guard
+
+        start_parent_liveness_guard(role="gateway")
+    except Exception:
+        pass
     sys.path.insert(0, str(PROJECT_ROOT))
 
     # Detached Windows gateway runs must ignore console-control broadcasts

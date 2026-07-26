@@ -19597,6 +19597,15 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
+            # Externally supervised backend (Desktop Runtime Unit): die with
+            # the declared parent so a force-killed supervisor never leaves an
+            # orphan serve (HERMES_PARENT_PID; no-op otherwise).
+            try:
+                from hermes_cli.parent_liveness import start_parent_liveness_guard
+
+                start_parent_liveness_guard(role="serve")
+            except Exception:
+                pass
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
