@@ -266,6 +266,9 @@ def test_channel_turn_lifecycle_broadcasts_to_desktop_observers(server):
         assert payload["stored_session_id"] == "chan-tip"
         assert payload["lineage_id"]
         assert payload["origin"] == "channel"
+        # 桌面从未提交过 channel turn，事件是它拿到用户原文做实时展示的
+        # 唯一来源（bug：飞书用户消息不出现在 Desktop 对话流）。
+        assert payload["user"] == "channel input"
 
         # desktop-origin turn：不广播（打开会话的订阅者才收流）。
         session2 = _session(server, "sid-desk", transport=_FakeTransport("p2"))

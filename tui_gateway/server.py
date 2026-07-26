@@ -131,6 +131,7 @@ from tui_gateway.turn_fifo import (
     SessionTurnState,
     TurnQueueFullError,
     TurnRecord,
+    _display_text,
     is_terminal_turn_state,
     make_turn_id,
     resolve_compression_lineage_root,
@@ -5906,6 +5907,11 @@ def _emit_turn_event(kind: str, sid: str, session: dict, record: TurnRecord, ext
         runtime_session_id=sid,
     )
     payload["state"] = record.state
+    # Display projection of the submitted input (same field name as
+    # queued_snapshot's "user"). A Desktop that never submitted this turn —
+    # notably every channel-origin turn — has no local copy of the text, so
+    # the lifecycle event is its only real-time source for transcript display.
+    payload["user"] = _display_text(record.text)
     if extra:
         payload.update(extra)
     _emit(kind, sid, payload)
