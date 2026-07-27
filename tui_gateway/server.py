@@ -11388,8 +11388,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         # Transient DB failure — keep pending_title for retry.
                         pass
 
+            # Channel sessions never get an auto-generated title: their
+            # desktop row is a PERSISTENT entity named by identity (manual
+            # rename > peer display name > platform label), and the title
+            # column is the manual-rename store — an auto summary written
+            # here would masquerade as a user-chosen name and make the
+            # pinned row's label drift with conversation content
+            # (channel-per-user-session design, naming follow-up).
+            _titling_source = str(session.get("source") or "").strip()
             if (
                 status == "complete"
+                and _titling_source in ("", "desktop", "tui", "cli")
                 and isinstance(raw, str)
                 and raw.strip()
                 and isinstance(text, str)
