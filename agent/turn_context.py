@@ -465,6 +465,16 @@ def build_turn_context(
             if agent._memory_nudge_interval > 0 and agent._turns_since_memory == 0:
                 agent._turns_since_memory = prior_user_turns % agent._memory_nudge_interval
 
+    # Chat provenance of this turn (merged per-user sessions): the serve run
+    # loop stamps agent._pending_user_origin_json for channel-origin turns.
+    # Attach to the in-memory user message under a private key (same pattern
+    # as _db_persisted) so the DB flush persists it as messages.origin_json;
+    # one-shot — cleared here so a later turn never inherits it.
+    _pending_origin = getattr(agent, "_pending_user_origin_json", None)
+    if _pending_origin:
+        user_msg["_origin_json"] = _pending_origin
+    agent._pending_user_origin_json = None
+
     # Add the current user message after the prompt/session setup has made
     # close persistence safe. The handoff above preserves any marker already
     # stamped by an earlier close flush.

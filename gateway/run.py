@@ -1767,6 +1767,23 @@ if _config_path.exists():
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
                 )
+        # Per-platform session scope (chat | user). Bridged as a JSON mapping
+        # so gateway/session.py::session_scope_for resolves it identically at
+        # every build_session_key call site without threading config through
+        # adapters. config.yaml wins when it declares scopes; a pre-set
+        # process env survives otherwise — the documented injection point for
+        # service managers (the MyAgents Desktop supervisor sets it on the
+        # Profile Runtime Unit env, same pattern as
+        # HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED above).
+        _platforms_cfg = _cfg.get("platforms", {})
+        if isinstance(_platforms_cfg, dict):
+            _scopes = {
+                str(_plat): str(_pcfg["session_scope"])
+                for _plat, _pcfg in _platforms_cfg.items()
+                if isinstance(_pcfg, dict) and _pcfg.get("session_scope")
+            }
+            if _scopes:
+                os.environ["HERMES_SESSION_SCOPE"] = json.dumps(_scopes)
         _display_cfg = _cfg.get("display", {})
         if _display_cfg and isinstance(_display_cfg, dict):
             if "busy_input_mode" in _display_cfg:
@@ -18837,6 +18854,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         trusted_source = {
             "platform": source.platform.value,
             "chat_type": getattr(source, "chat_type", "") or "",
+            # Under user-scope session keys the chat window no longer appears
+            # in the session key, so chat_id rides the turn as origin
+            # metadata (per-turn provenance for transcript labeling).
+            "chat_id": getattr(source, "chat_id", None) or "",
             "chat_name": getattr(source, "chat_name", None) or "",
             "user_id": getattr(source, "user_id", None) or "",
             "user_id_alt": getattr(source, "user_id_alt", None) or "",

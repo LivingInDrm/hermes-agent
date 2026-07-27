@@ -136,3 +136,56 @@ def test_envelope_carries_required_fields():
         "delivery_mode": "desktop-only",
     }
     assert envelope["runtime_generation"]
+
+
+# ── origin_chat provenance (channel-per-user-session design §5.2) ──────────
+
+def _channel_record(seq, trusted_source):
+    record = _record(seq, origin="channel")
+    record.delivery_mode = "origin-channel"
+    record.trusted_source = trusted_source
+    return record
+
+
+def test_origin_chat_projected_for_channel_turns():
+    from tui_gateway.turn_fifo import origin_chat_projection
+
+    record = _channel_record(1, {
+        "platform": "feishu",
+        "chat_type": "group",
+        "chat_id": "oc_group",
+        "chat_name": "产品群",
+        "thread_id": "omt_topic",
+        "user_id": "ou_user",
+    })
+    assert origin_chat_projection(record) == {
+        "chat_type": "group",
+        "chat_name": "产品群",
+        "thread_id": "omt_topic",
+    }
+
+
+def test_origin_chat_absent_for_desktop_turns():
+    from tui_gateway.turn_fifo import origin_chat_projection
+
+    assert origin_chat_projection(_record(1)) is None
+    # Channel record without trusted_source (defensive): nothing to project.
+    assert origin_chat_projection(_record(2, origin="channel")) is None
+
+
+def test_queued_snapshot_carries_origin_chat():
+    state = SessionTurnState()
+    state.active = _record(1)
+    state.active.state = "running"
+    channel = _channel_record(2, {"chat_type": "dm", "chat_name": "刘晓春"})
+    desktop = _record(3)
+    state.enqueue(channel)
+    state.enqueue(desktop)
+
+    snapshot = state.queued_snapshot()
+    assert snapshot[0]["origin_chat"] == {
+        "chat_type": "dm",
+        "chat_name": "刘晓春",
+        "thread_id": "",
+    }
+    assert "origin_chat" not in snapshot[1]

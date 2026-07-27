@@ -134,6 +134,8 @@ from tui_gateway.turn_fifo import (
     _display_text,
     is_terminal_turn_state,
     make_turn_id,
+    origin_chat_projection,
+    origin_persistence_json,
     resolve_compression_lineage_root,
 )
 
@@ -3963,7 +3965,11 @@ def _current_profile_name() -> str:
 #     generation-local clientTurnId dedup, turn.* event envelopes and the
 #     runtime_generation/capabilities fields in session info payloads
 #     (MyAgents channel-desktop-shared-session-runtime.md §7/§8/§12.4).
-DESKTOP_BACKEND_CONTRACT = 5
+# v6: per-user merged channel sessions — session_scope config, user-scope
+#     session keys, per-turn origin_chat on turn.* events / queued snapshots,
+#     trusted_source.chat_id, messages.origin_json persistence + REST
+#     exposure (MyAgents channel-per-user-session.md).
+DESKTOP_BACKEND_CONTRACT = 6
 
 # Explicit capability names so the desktop can gate features on what this
 # build actually implements instead of inferring from the contract number.
@@ -3971,6 +3977,7 @@ DESKTOP_BACKEND_CONTRACT = 5
 DESKTOP_BACKEND_CAPABILITIES: tuple = (
     "volatile_turn_fifo_v1",
     "turn_delivery_mode_v1",
+    "per_user_session_scope_v1",
 )
 
 
@@ -5942,6 +5949,11 @@ def _emit_turn_event(kind: str, sid: str, session: dict, record: TurnRecord, ext
     # notably every channel-origin turn — has no local copy of the text, so
     # the lifecycle event is its only real-time source for transcript display.
     payload["user"] = _display_text(record.text)
+    # Chat provenance for merged per-user sessions: which DM/group/topic this
+    # turn was said in. Absent on desktop-origin turns.
+    origin_chat = origin_chat_projection(record)
+    if origin_chat:
+        payload["origin_chat"] = origin_chat
     if extra:
         payload.update(extra)
     _emit(kind, sid, payload)
@@ -6028,6 +6040,11 @@ def _prepare_turn_executor(sid: str, session: dict, record: TurnRecord) -> None:
         json.dumps(record.execution_hints or {}, sort_keys=True),
     )
     with session["history_lock"]:
+        # Per-turn chat provenance for the merged-session transcript. Set
+        # unconditionally (None for desktop-origin) BEFORE the signature
+        # early-return so a reused executor never inherits the previous
+        # turn's origin. Consumed by _run_prompt_submit → agent stamp.
+        session["_active_turn_origin_json"] = origin_persistence_json(record)
         previous = session.get("_executor_signature")
         if previous == signature and session.get("agent") is not None:
             return
@@ -10990,6 +11007,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         if not isinstance(session.get("inflight_turn"), dict):
             _start_inflight_turn(session, text)
     agent = session["agent"]
+    # Hand this turn's chat provenance to the executor so the user row it
+    # persists carries origin_json (merged per-user sessions). Cleared by
+    # turn_context after stamping; None for desktop-origin turns.
+    try:
+        agent._pending_user_origin_json = session.get("_active_turn_origin_json")
+    except Exception:
+        pass
     if hasattr(agent, "clear_interrupt"):
         try:
             agent.clear_interrupt()

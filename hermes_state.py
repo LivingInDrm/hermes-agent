@@ -910,7 +910,8 @@ CREATE TABLE IF NOT EXISTS messages (
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
-    api_content TEXT
+    api_content TEXT,
+    origin_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -4249,6 +4250,7 @@ class SessionDB:
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
         api_content: Optional[str] = None,
+        origin_json: Optional[str] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -4261,6 +4263,12 @@ class SessionDB:
         independent of the SQLite autoincrement primary key and is used by
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
+
+        ``origin_json`` is the chat provenance of a channel-origin turn's
+        user row (``{"chat_type","chat_id","chat_name","thread_id"}``) under
+        merged per-user sessions, where one session receives input from many
+        chat windows. NULL for desktop-origin rows and all non-user roles —
+        display projects the user row's origin forward across its turn.
 
         ``api_content`` is the exact content string sent to the API for this
         message when it differs from ``content`` (ephemeral memory/plugin
@@ -4316,8 +4324,9 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content,
+                   origin_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4338,6 +4347,7 @@ class SessionDB:
                     1 if observed else 0,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                    origin_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -4417,12 +4427,18 @@ class SessionDB:
 
             api_content = msg.get("api_content")
 
+            # Chat provenance survives rewrites (truncate/undo/compaction):
+            # rows reloaded from the DB carry `origin_json`; live in-memory
+            # user messages carry the `_origin_json` bookkeeping key.
+            origin_json = msg.get("origin_json") or msg.get("_origin_json")
+
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content,
+                   origin_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4443,6 +4459,7 @@ class SessionDB:
                     1 if msg.get("observed") else 0,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                    origin_json if isinstance(origin_json, str) and origin_json else None,
                 ),
             )
             inserted += 1
@@ -4969,10 +4986,7 @@ class SessionDB:
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
-                "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-                "api_content "
+                f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
@@ -5000,7 +5014,7 @@ class SessionDB:
         "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-        "api_content"
+        "api_content, origin_json"
     )
 
     def _rows_to_conversation(
@@ -5032,6 +5046,11 @@ class SessionDB:
             # re-introduce the divergence it exists to remove.
             if row["api_content"]:
                 msg["api_content"] = row["api_content"]
+            # Chat provenance (merged per-user sessions). Restored under the
+            # same key replace_messages/_insert_message_rows read, so history
+            # rewrites (truncate/undo/compaction) keep it on surviving rows.
+            if row["origin_json"]:
+                msg["origin_json"] = row["origin_json"]
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:

@@ -3350,6 +3350,30 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
         """Apply Feishu-specific burst protection before entering the base adapter."""
+        # User-scope fail-explicit gate (channel-per-user-session design):
+        # a source with no participant identity cannot derive a per-user key.
+        # Drop here — the single funnel for all inbound Feishu messages —
+        # instead of letting build_session_key raise deep inside batching or
+        # guard paths. Falling back to a shared per-chat bucket is forbidden:
+        # it would mix unattributed traffic into real users' merged sessions.
+        from gateway.session import (
+            SESSION_SCOPE_USER,
+            session_scope_for,
+            user_scope_participant_id,
+        )
+
+        if (
+            session_scope_for(event.source.platform.value) == SESSION_SCOPE_USER
+            and not user_scope_participant_id(event.source)
+        ):
+            logger.warning(
+                "[Feishu] Dropping message without participant identity under "
+                "session_scope=user: id=%s chat_type=%s",
+                event.message_id,
+                event.source.chat_type,
+            )
+            return
+
         if event.message_type == MessageType.TEXT and not event.is_command():
             await self._enqueue_text_event(event)
             return

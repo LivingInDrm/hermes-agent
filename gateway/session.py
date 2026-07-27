@@ -860,6 +860,68 @@ class SessionEntry:
         )
 
 
+# ---------------------------------------------------------------------------
+# Session scope ("chat" per-window isolation vs "user" per-participant merge)
+# ---------------------------------------------------------------------------
+
+# Bridged from config.yaml ``platforms.<name>.session_scope`` at gateway
+# startup (see gateway/run.py), same pattern as HERMES_AUTO_CONTINUE_FRESHNESS.
+# JSON object mapping platform name → scope, e.g. {"feishu": "user"}.
+_SESSION_SCOPE_ENV = "HERMES_SESSION_SCOPE"
+SESSION_SCOPE_CHAT = "chat"
+SESSION_SCOPE_USER = "user"
+_VALID_SESSION_SCOPES = frozenset({SESSION_SCOPE_CHAT, SESSION_SCOPE_USER})
+
+
+class MissingParticipantIdentity(ValueError):
+    """User-scope session key requires a participant identity.
+
+    Raised by :func:`build_session_key` when ``session_scope`` resolves to
+    ``user`` but the source carries no ``user_id``/``user_id_alt`` (bot or
+    system events whose sender is not a user). Callers on message-intake
+    paths must catch this and drop the message with a warning — falling back
+    to a shared per-chat bucket would mix unattributed traffic into real
+    users' merged sessions.
+    """
+
+
+def session_scope_for(platform: str) -> str:
+    """Return the configured session scope for a platform (default: chat).
+
+    Reads the startup-bridged env mapping on every call so all key-derivation
+    call sites in the process agree without threading a parameter through
+    every adapter. Unknown platforms and malformed values fall back to
+    ``chat`` (byte-identical legacy keys).
+    """
+    raw = os.environ.get(_SESSION_SCOPE_ENV)
+    if not raw:
+        return SESSION_SCOPE_CHAT
+    try:
+        mapping = json.loads(raw)
+    except (TypeError, ValueError):
+        return SESSION_SCOPE_CHAT
+    if not isinstance(mapping, dict):
+        return SESSION_SCOPE_CHAT
+    scope = str(mapping.get(platform, SESSION_SCOPE_CHAT))
+    return scope if scope in _VALID_SESSION_SCOPES else SESSION_SCOPE_CHAT
+
+
+def user_scope_participant_id(source: SessionSource) -> Optional[str]:
+    """Resolve the participant identity used by user-scope session keys.
+
+    Preference order matches the per-user isolation segment in chat-scope
+    keys: ``user_id_alt`` (Feishu union_id — stable across apps) over
+    ``user_id``. WhatsApp identifiers are canonicalised so JID/LID alias
+    flips don't fork the merged session.
+    """
+    participant_id = source.user_id_alt or source.user_id
+    if participant_id and source.platform == Platform.WHATSAPP:
+        participant_id = (
+            canonical_whatsapp_identifier(str(participant_id)) or participant_id
+        )
+    return str(participant_id) if participant_id else None
+
+
 def is_shared_multi_user_session(
     source: SessionSource,
     *,
@@ -870,11 +932,15 @@ def is_shared_multi_user_session(
 
     Mirrors the isolation rules in :func:`build_session_key`:
       - DMs are never shared.
+      - User-scope platforms never share: every session belongs to exactly
+        one participant regardless of chat type.
       - Threads are shared unless ``thread_sessions_per_user`` is True.
       - Non-thread group/channel sessions are shared unless
         ``group_sessions_per_user`` is True (default: True = isolated).
     """
     if source.chat_type == "dm":
+        return False
+    if session_scope_for(source.platform.value) == SESSION_SCOPE_USER:
         return False
     if source.thread_id:
         return not thread_sessions_per_user
@@ -906,10 +972,23 @@ def build_session_key(
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
     profile: Optional[str] = None,
+    session_scope: Optional[str] = None,
 ) -> str:
     """Build a deterministic session key from a message source.
 
     This is the single source of truth for session key construction.
+
+    ``session_scope`` selects the key dimension. ``None`` (the default)
+    resolves the platform's configured scope via :func:`session_scope_for`,
+    so the many call sites across adapters/runner/slash-commands agree
+    without each threading the config through. Explicit values are for tests.
+
+    ``user`` scope collapses dm/group/thread into one key per participant:
+    ``agent:<ns>:<platform>:user:<participant_id>`` — ``user`` occupies the
+    chat_type slot so positional parsers (``parts[2]`` == platform) still
+    hold. ``chat_id``/``thread_id`` do not enter the key; they become
+    per-turn origin metadata. Sources without a participant identity raise
+    :class:`MissingParticipantIdentity` (fail-explicit, no shared bucket).
 
     ``profile`` selects the key namespace (see :func:`_session_key_namespace`).
     It defaults to ``None`` ⇒ the legacy ``agent:main`` namespace, so callers
@@ -937,6 +1016,19 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+
+    scope = session_scope if session_scope is not None else session_scope_for(platform)
+    if scope == SESSION_SCOPE_USER:
+        participant_id = user_scope_participant_id(source)
+        if not participant_id:
+            raise MissingParticipantIdentity(
+                f"session_scope=user requires a participant identity; "
+                f"source platform={platform} chat_type={source.chat_type} "
+                f"chat_id={_hash_chat_id(str(source.chat_id)) if source.chat_id else '<none>'} "
+                f"has neither user_id nor user_id_alt"
+            )
+        return f"{ns}:{platform}:user:{participant_id}"
+
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -1557,6 +1649,16 @@ class SessionStore:
         recorder = getattr(self._db, "record_gateway_session_peer", None)
         if not callable(recorder):
             return
+        # Under user-scope keys the session's peer is the PERSON, not any one
+        # chat window — a merged session receives traffic from many chats, so
+        # its display identity is the participant's name (desktop channel-task
+        # titles read this). Chat-scope sessions keep the chat name.
+        if (
+            not display_name
+            and session_scope_for(source.platform.value) == SESSION_SCOPE_USER
+            and source.user_name
+        ):
+            display_name = source.user_name
         try:
             origin_json = None
             try:

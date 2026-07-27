@@ -930,6 +930,12 @@ def run_conversation(
                 api_msg.pop("finish_reason")
             # Strip internal thinking-prefill marker
             api_msg.pop("_thinking_prefill", None)
+            # Strip chat-provenance bookkeeping (persisted as
+            # messages.origin_json; never a provider field). Live turns carry
+            # the `_origin_json` stamp; reloaded history rows carry
+            # `origin_json` from the conversation projection.
+            api_msg.pop("_origin_json", None)
+            api_msg.pop("origin_json", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields

@@ -68,6 +68,50 @@ class TurnQueueFullError(Exception):
         self.retryable = True
 
 
+def origin_persistence_json(record: "TurnRecord") -> Optional[str]:
+    """JSON provenance persisted on the turn's user message row.
+
+    Superset of :func:`origin_chat_projection`: includes ``chat_id`` so the
+    durable transcript can address the exact source window. Event payloads
+    stay chat_id-free (the desktop renderer never sees platform IDs); the
+    persisted row is read through the desktop's anti-corruption layer which
+    strips it before the renderer.
+    """
+    trusted = record.trusted_source or {}
+    if record.origin != "channel" or not trusted:
+        return None
+    import json as _json
+
+    return _json.dumps(
+        {
+            "chat_type": str(trusted.get("chat_type") or ""),
+            "chat_id": str(trusted.get("chat_id") or ""),
+            "chat_name": str(trusted.get("chat_name") or ""),
+            "thread_id": str(trusted.get("thread_id") or ""),
+        },
+        ensure_ascii=False,
+    )
+
+
+def origin_chat_projection(record: "TurnRecord") -> Optional[dict]:
+    """Chat provenance of a channel-origin turn, for transcript labeling.
+
+    Under user-scope session keys one merged session receives turns from
+    many chat windows (DM / groups / topics), so "where was this said" lives
+    on the turn, not the session. Distinct from the envelope's ``origin``
+    field, which is the turn's origin *kind* ("desktop" | "channel").
+    Desktop-origin turns have no trusted_source and project nothing.
+    """
+    trusted = record.trusted_source or {}
+    if record.origin != "channel" or not trusted:
+        return None
+    return {
+        "chat_type": str(trusted.get("chat_type") or ""),
+        "chat_name": str(trusted.get("chat_name") or ""),
+        "thread_id": str(trusted.get("thread_id") or ""),
+    }
+
+
 @dataclass
 class TurnRecord:
     """One independent user input and its execution lifecycle."""
@@ -190,6 +234,11 @@ class SessionTurnState:
                 "delivery_mode": record.delivery_mode,
                 "user": _display_text(record.text),
                 "enqueued_at": record.enqueued_at,
+                **(
+                    {"origin_chat": origin_chat}
+                    if (origin_chat := origin_chat_projection(record))
+                    else {}
+                ),
             }
             for record in self.queue
         ]
