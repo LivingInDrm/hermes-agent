@@ -136,3 +136,85 @@ class TestSharedMultiUserUnderUserScope:
         group = _source(chat_type="group", chat_id="oc_group")
         assert is_shared_multi_user_session(group, group_sessions_per_user=False)
         assert not is_shared_multi_user_session(group, group_sessions_per_user=True)
+
+
+class TestDelegatedRouteSkipsGatewayDbRow:
+    """Delegated routes: serve owns persistence — no gateway sqlite row
+    (regression: orphaned empty duplicate surfaced as a second desktop task)."""
+
+    def _store(self, tmp_path, delegated):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+
+        class _Db:
+            def __init__(self):
+                self.created = []
+
+            def create_session(self, **kwargs):
+                self.created.append(kwargs)
+
+            def record_gateway_session_peer(self, *args, **kwargs):
+                pass
+
+        store = SessionStore(tmp_path, GatewayConfig())
+        store._db = _Db()
+        store.runtime_delegated_probe = lambda source: delegated
+        return store
+
+    def test_delegated_source_creates_entry_but_no_db_row(self, tmp_path):
+        store = self._store(tmp_path, delegated=True)
+        entry = store.get_or_create_session(_source())
+        assert entry.session_key
+        assert store._db.created == []
+
+    def test_non_delegated_source_still_creates_db_row(self, tmp_path):
+        store = self._store(tmp_path, delegated=False)
+        store.get_or_create_session(_source())
+        assert len(store._db.created) == 1
+
+
+class TestUserScopeDisplayName:
+    """User-scope peer stamp: display identity is the person; never fall back
+    to chat_name (Feishu DM chat_name degrades to the raw oc_ chat_id)."""
+
+    def _capture(self, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+
+        class _Db:
+            def __init__(self):
+                self.stamps = []
+
+            def record_gateway_session_peer(self, *args, **kwargs):
+                self.stamps.append(kwargs)
+
+        store = SessionStore(tmp_path, GatewayConfig())
+        store._db = _Db()
+        return store
+
+    def test_user_scope_prefers_user_name_and_never_chat_name(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SCOPE", json.dumps({"feishu": "user"}))
+        store = self._capture(tmp_path)
+        named = SessionSource(
+            platform=Platform.FEISHU, chat_id="oc_x", chat_name="oc_x",
+            chat_type="dm", user_id="ou_a", user_name="刘晓春",
+        )
+        store._record_gateway_session_peer("sid-1", "key-1", named)
+        assert store._db.stamps[-1]["display_name"] == "刘晓春"
+
+        anonymous = SessionSource(
+            platform=Platform.FEISHU, chat_id="oc_x", chat_name="oc_x",
+            chat_type="dm", user_id="ou_a",
+        )
+        store._record_gateway_session_peer("sid-2", "key-2", anonymous)
+        assert store._db.stamps[-1]["display_name"] is None
+
+    def test_chat_scope_keeps_chat_name_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_SESSION_SCOPE", raising=False)
+        store = self._capture(tmp_path)
+        source = SessionSource(
+            platform=Platform.FEISHU, chat_id="oc_x", chat_name="产品群",
+            chat_type="group", user_id="ou_a",
+        )
+        store._record_gateway_session_peer("sid-3", "key-3", source)
+        assert store._db.stamps[-1]["display_name"] == "产品群"

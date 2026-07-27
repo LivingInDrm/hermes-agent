@@ -3177,6 +3177,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 key, max_active_age=_bg_max_age_seconds,
             ),
         )
+        # Delegated routes must not create gateway-side sqlite session rows —
+        # serve owns session persistence there (see get_or_create_session).
+        self.session_store.runtime_delegated_probe = (
+            lambda source: self._runtime_delegate_enabled_for(source)
+        )
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.

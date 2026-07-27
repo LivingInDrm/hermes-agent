@@ -10470,6 +10470,8 @@ def _stamp_channel_peer(session: dict) -> None:
             str(session.get("session_key") or ""),
             source=str(peer.get("source") or ""),
             session_key=str(peer.get("session_key") or ""),
+            **({"display_name": str(peer["display_name"])} if peer.get("display_name") else {}),
+            **({"user_id": str(peer["user_id"])} if peer.get("user_id") else {}),
         )
         session["_channel_peer_stamped"] = True
     except Exception:
@@ -10550,6 +10552,17 @@ def _(rid, params: dict) -> dict:
             if not source or not source_session_key:
                 return _err(rid, 4032, "channel-create requires source and source_session_key")
             resolved = _resolve_channel_conversation(rid, source, source_session_key)
+            # Peer display identity for the durable row (merged per-user
+            # sessions): serve owns session persistence on delegated routes,
+            # so the desktop's channel-task title (display_name = the person)
+            # must be stamped here — the gateway no longer writes its own row.
+            if not isinstance(resolved, dict) and isinstance(trusted_source, dict):
+                peer = resolved[1].get("_channel_peer")
+                if isinstance(peer, dict):
+                    if trusted_source.get("user_name"):
+                        peer.setdefault("display_name", str(trusted_source["user_name"]))
+                    if trusted_source.get("user_id"):
+                        peer.setdefault("user_id", str(trusted_source["user_id"]))
         elif kind == "stored":
             stored_id = str(conversation.get("stored_session_id") or "")
             if not stored_id:

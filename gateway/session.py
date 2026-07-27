@@ -1652,13 +1652,14 @@ class SessionStore:
         # Under user-scope keys the session's peer is the PERSON, not any one
         # chat window — a merged session receives traffic from many chats, so
         # its display identity is the participant's name (desktop channel-task
-        # titles read this). Chat-scope sessions keep the chat name.
-        if (
-            not display_name
-            and session_scope_for(source.platform.value) == SESSION_SCOPE_USER
-            and source.user_name
-        ):
-            display_name = source.user_name
+        # titles read this). chat_name must NOT be the fallback there: for
+        # Feishu DMs it degrades to the raw chat_id, which would surface as a
+        # literal "oc_…" title. Better no name than a platform identifier.
+        # Chat-scope sessions keep the chat-name behaviour.
+        if session_scope_for(source.platform.value) == SESSION_SCOPE_USER:
+            effective = display_name or source.user_name or None
+        else:
+            effective = display_name or source.chat_name
         try:
             origin_json = None
             try:
@@ -1673,7 +1674,7 @@ class SessionStore:
                 chat_id=source.chat_id,
                 chat_type=source.chat_type,
                 thread_id=source.thread_id,
-                display_name=display_name or source.chat_name,
+                display_name=effective,
                 origin_json=origin_json,
             )
         except TypeError:
@@ -2180,7 +2181,21 @@ class SessionStore:
             assert published is not None
             entry = published
             _needs_save = True
-            if entry is candidate:
+            # Runtime-delegated routes: serve is the sole session-persistence
+            # owner (resolve-or-create on source_session_key + peer stamp at
+            # first persist). Creating a gateway-side sqlite row here races
+            # serve's resolve and leaves an orphaned empty duplicate that
+            # surfaces as a second channel task on the desktop. The
+            # sessions.json entry (routing/expiry/model-override bookkeeping)
+            # is still created above; only the DB row is skipped.
+            delegated = False
+            probe = getattr(self, "runtime_delegated_probe", None)
+            if callable(probe):
+                try:
+                    delegated = bool(probe(source))
+                except Exception:
+                    delegated = False
+            if entry is candidate and not delegated:
                 db_create_kwargs = {
                     "session_id": session_id,
                     "source": source.platform.value,
