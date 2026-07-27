@@ -900,6 +900,17 @@ class GatewayConfig:
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
 
+    # Shared-session runtime delegation (route-scoped, default OFF — empty
+    # dict means disabled).  Shape mirrors DEFAULT_CONFIG["gateway"]
+    # ["runtime_delegate"] in hermes_cli/config.py: {enabled, platforms,
+    # event_routes, url, token}.  When enabled for a platform+route the
+    # gateway submits prepared turns to the profile's `hermes serve` runtime
+    # (turn.submit over /api/ws) instead of running a local AIAgent; the
+    # channel control plane stays in the gateway.  See
+    # docs/design/channel-desktop-shared-session-runtime.md and
+    # gateway/runtime_client.py.
+    runtime_delegate: dict = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
@@ -1023,6 +1034,7 @@ class GatewayConfig:
                 asdict(r) if is_dataclass(r) and not isinstance(r, type) else r
                 for r in self.profile_routes
             ],
+            "runtime_delegate": self.runtime_delegate,
         }
     
     @classmethod
@@ -1128,6 +1140,15 @@ class GatewayConfig:
         from gateway.profile_routing import parse_profile_routes
         profile_routes = parse_profile_routes(data.get("profile_routes") or [])
 
+        # Runtime delegation config: top-level key wins, nested gateway.*
+        # fallback (matching the systemd_watchdog_seconds pattern above).
+        # Non-dict values fall back to {} (= disabled).
+        runtime_delegate = data.get("runtime_delegate")
+        if not isinstance(runtime_delegate, dict) and isinstance(nested_gateway, dict):
+            runtime_delegate = nested_gateway.get("runtime_delegate")
+        if not isinstance(runtime_delegate, dict):
+            runtime_delegate = {}
+
         return cls(
             platforms=platforms,
             default_reset_policy=default_policy,
@@ -1152,6 +1173,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
+            runtime_delegate=runtime_delegate,
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -1335,6 +1357,16 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["write_sessions_json"] = yaml_cfg["write_sessions_json"]
             elif isinstance(gateway_section, dict) and "write_sessions_json" in gateway_section:
                 gw_data["write_sessions_json"] = gateway_section["write_sessions_json"]
+
+            # runtime_delegate: top-level wins; nested gateway.* fallback
+            # (matches the write_sessions_json / streaming precedence
+            # pattern — `hermes config set gateway.runtime_delegate.*`
+            # naturally produces the nested shape).
+            _rtd = yaml_cfg.get("runtime_delegate")
+            if not isinstance(_rtd, dict) and isinstance(gateway_section, dict):
+                _rtd = gateway_section.get("runtime_delegate")
+            if isinstance(_rtd, dict):
+                gw_data["runtime_delegate"] = _rtd
 
             if "filter_silence_narration" in yaml_cfg:
                 gw_data["filter_silence_narration"] = yaml_cfg[

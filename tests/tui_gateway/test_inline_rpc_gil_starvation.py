@@ -42,10 +42,16 @@ def server():
     }):
         import importlib
         mod = importlib.import_module("tui_gateway.server")
+        # These tests overwrite _methods entries (session.list / pet.info /
+        # prompt.submit / fast.check) with fakes; snapshot and restore so the
+        # fakes cannot leak into later test files sharing the module.
+        methods_snapshot = dict(mod._methods)
         yield mod
         mod._sessions.clear()
         mod._pending.clear()
         mod._answers.clear()
+        mod._methods.clear()
+        mod._methods.update(methods_snapshot)
 
 
 @pytest.fixture()

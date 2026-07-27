@@ -125,6 +125,17 @@ except Exception:
     pass
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
+from tui_gateway.turn_fifo import (
+    RUNTIME_GENERATION,
+    GenerationDedupTable,
+    SessionTurnState,
+    TurnQueueFullError,
+    TurnRecord,
+    _display_text,
+    is_terminal_turn_state,
+    make_turn_id,
+    resolve_compression_lineage_root,
+)
 
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
@@ -263,6 +274,9 @@ _LONG_HANDLERS = frozenset(
         "shell.exec",
         "skills.manage",
         "slash.exec",
+        # turn.submit's cold path resolves lineage against the profile DB and
+        # may register a deferred session (same work as session.resume).
+        "turn.submit",
     }
 )
 
@@ -885,6 +899,14 @@ def _close_sessions_for_transport(
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+        observed = [s for s in _sessions.values() if isinstance(s.get("subscribers"), dict)]
+    # Observer subscriptions die with their transport — they never keep a
+    # session alive and never migrate to another socket (design §9.2).
+    for session in observed:
+        subscribers = session.get("subscribers") or {}
+        stale = [key for key, sub in subscribers.items() if sub is transport]
+        for key in stale:
+            subscribers.pop(key, None)
     reaped = 0
     detached = 0
     for sid, session in owned:
@@ -1191,14 +1213,52 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _session_event_targets(session: dict) -> list:
+    """Every transport that observes this session's events (design §9).
+
+    - the session's primary transport (historical single-owner routing);
+    - the active turn's submitting transport — the per-turn sink: a
+      channel-origin turn streams back to the Gateway Runtime Client that
+      submitted it even while a Desktop client holds the primary transport;
+    - registered subscribers (Desktop observers via session.subscribe that
+      must not steal anyone's reply route).
+
+    Deduplicated by object identity; order = primary first.
+    """
+    targets = []
+    primary = session.get("transport")
+    if primary is not None:
+        targets.append(primary)
+    state = session.get("turn_state")
+    if isinstance(state, SessionTurnState):
+        active = state.active
+        # Deliberately include the sink of a TERMINAL active record too:
+        # _finish_active_turn marks the record terminal *before* emitting
+        # turn.completed/interrupted/failed, and that terminal event is
+        # exactly what the Gateway delivery sink is waiting on. The record
+        # (and its sink) is replaced when the next turn is promoted; until
+        # then, post-turn session events reaching the old sink are harmless —
+        # sinks filter by turn envelope.
+        if active is not None:
+            sink = active.transport
+            if sink is not None and all(sink is not t for t in targets):
+                targets.append(sink)
+    subscribers = session.get("subscribers")
+    if isinstance(subscribers, dict):
+        for subscriber in subscribers.values():
+            if subscriber is not None and all(subscriber is not t for t in targets):
+                targets.append(subscriber)
+    return targets
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
     Precedence:
 
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+    1. Event frames with a session id → every transport observing that
+       session (primary + active turn sink + subscribers). The return value
+       reflects the primary write; secondary deliveries are best-effort.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -1206,8 +1266,16 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+        if sid and (session := _sessions.get(sid)) is not None:
+            targets = _session_event_targets(session)
+            if targets:
+                ok = targets[0].write(obj)
+                for extra in targets[1:]:
+                    try:
+                        extra.write(obj)
+                    except Exception:
+                        pass
+                return ok
 
     return (current_transport() or _stdio_transport).write(obj)
 
@@ -1216,6 +1284,23 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     params = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
+    # Attribute mid-turn events (message.delta, tool.*, …) to the active turn
+    # so multi-consumer clients (Desktop observer, Gateway delivery sink) can
+    # associate the stream with a turn without guessing (design §7.5/§9.2).
+    # Additive sibling key — payload shapes stay untouched.
+    session = _sessions.get(sid)
+    if session is not None:
+        state = session.get("turn_state")
+        if isinstance(state, SessionTurnState):
+            active = state.active
+            if active is not None and not is_terminal_turn_state(active.state):
+                params["turn"] = {
+                    "turn_id": active.turn_id,
+                    "sequence": active.sequence,
+                    "origin": active.origin,
+                    "delivery_mode": active.delivery_mode,
+                    "runtime_generation": RUNTIME_GENERATION,
+                }
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 
 
@@ -1341,6 +1426,7 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+    _finish_active_turn(sid, session, "failed" if is_error else None)
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
@@ -1616,7 +1702,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 kw = {"session_db": session_db}
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
-                kw["platform_override"] = _session_source(current)
+                kw["platform_override"] = current.get("_executor_platform") or _session_source(current)
                 resume_overrides = current.get("resume_runtime_overrides")
                 if isinstance(resume_overrides, dict) and resume_overrides:
                     # Cold deferred resume: restore the full persisted runtime
@@ -1635,6 +1721,25 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                # Channel-origin executor context (shared session runtime):
+                # gateway-authenticated ephemeral prompt and allowlisted
+                # one-shot hints override the desktop-side defaults.
+                executor_platform = current.get("_executor_platform")
+                if executor_platform and executor_platform != "desktop":
+                    kw["channel_platform"] = executor_platform
+                if ephemeral := current.get("_executor_ephemeral_prompt"):
+                    kw["ephemeral_prompt_override"] = str(ephemeral)
+                hints = current.get("_executor_hints") or {}
+                if isinstance(hints, dict) and hints:
+                    if hints.get("model"):
+                        hint_override = {"model": str(hints["model"])}
+                        if hints.get("provider"):
+                            hint_override["provider"] = str(hints["provider"])
+                        kw["model_override"] = hint_override
+                    if hints.get("reasoning_effort"):
+                        kw["reasoning_config_override"] = {"effort": str(hints["reasoning_effort"])}
+                    if hints.get("service_tier"):
+                        kw["service_tier_override"] = str(hints["service_tier"])
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2358,11 +2463,19 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
         _pending_prompt_payloads[rid] = (event, dict(payload))
+    # A clarify raised inside a channel-origin turn has no interactive owner
+    # on the regular event targets (primary + sink are the Messaging
+    # Gateway): broadcast it to desktop observers too, so the shared-session
+    # Desktop page can answer (clarify.respond is request_id-keyed — first
+    # responder wins). Secret/sudo prompts are intentionally NOT broadcast.
+    clarify_broadcast = event == "clarify.request" and _active_turn_origin(sid) == "channel"
     answered = False
     answer = ""
     answer_present = False
     try:
         _emit(event, sid, payload)
+        if clarify_broadcast:
+            _broadcast_channel_turn_event(event, sid, dict(payload))
         answered = ev.wait(timeout=timeout)
     finally:
         with _prompt_lock:
@@ -2377,7 +2490,29 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
             sid,
             {"request_id": rid},
         )
+    if event == "clarify.request":
+        # Resolution fan-out (answered anywhere / timeout): every surface
+        # drops its stale prompt, and the Gateway relay releases its pending
+        # entry so the next channel message is not swallowed as an answer.
+        _emit("clarify.expire", sid, {"request_id": rid})
+        if clarify_broadcast:
+            _broadcast_channel_turn_event("clarify.expire", sid, {"request_id": rid})
     return answer
+
+
+def _active_turn_origin(sid: str) -> str:
+    """Origin of the session's active turn ("desktop" | "channel" | "")."""
+    session = _sessions.get(sid)
+    if not isinstance(session, dict):
+        return ""
+    try:
+        with session["history_lock"]:
+            record = _turn_state(session).active
+    except Exception:
+        return ""
+    if record is None or is_terminal_turn_state(record.state):
+        return ""
+    return str(record.origin or "")
 
 
 def _clear_pending(sid: str | None = None) -> None:
@@ -3687,6 +3822,21 @@ def _sync_session_key_after_compress(
         except Exception:
             pass
 
+    # Shared session runtime: announce the new durable tip so subscribers
+    # refresh their cached stored ref; queued turns are lineage-bound and
+    # resolve the fresh tip when they start (design §10.3). The lineage root
+    # itself never changes on compression.
+    try:
+        _emit("session.tip.updated", sid, {
+            "lineage_id": _session_lineage_id(session),
+            "stored_session_id": str(new_session_id or ""),
+            "previous_stored_session_id": str(old_key or ""),
+            "runtime_session_id": sid,
+            "runtime_generation": RUNTIME_GENERATION,
+        })
+    except Exception:
+        pass
+
 
 def _get_usage(agent) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
@@ -3809,7 +3959,19 @@ def _current_profile_name() -> str:
 # v2: adds the file.attach RPC (remote-gateway non-image file upload).
 # v3: adds approvals.mode config RPCs and session.info reconciliation.
 # v4: session.create fast=false is an explicit per-session normal-tier override.
-DESKTOP_BACKEND_CONTRACT = 4
+# v5: shared session runtime — turn.submit, per-session in-memory turn FIFO,
+#     generation-local clientTurnId dedup, turn.* event envelopes and the
+#     runtime_generation/capabilities fields in session info payloads
+#     (MyAgents channel-desktop-shared-session-runtime.md §7/§8/§12.4).
+DESKTOP_BACKEND_CONTRACT = 5
+
+# Explicit capability names so the desktop can gate features on what this
+# build actually implements instead of inferring from the contract number.
+# Extended as the shared-session-runtime milestones land.
+DESKTOP_BACKEND_CAPABILITIES: tuple = (
+    "volatile_turn_fifo_v1",
+    "turn_delivery_mode_v1",
+)
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:
@@ -3912,6 +4074,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "title": _session_live_title(session or {}, session_key) if session_key else "",
         "stored_session_id": session_key or "",
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "capabilities": list(DESKTOP_BACKEND_CAPABILITIES),
+        "runtime_generation": RUNTIME_GENERATION,
         "version": "",
         "release_date": "",
         "update_behind": None,
@@ -5070,6 +5234,8 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    channel_platform: str | None = None,
+    ephemeral_prompt_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5104,6 +5270,10 @@ def _make_agent(
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
     system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
+    if ephemeral_prompt_override:
+        # Channel-origin executor: the Gateway-prepared channel prompt owns
+        # the ephemeral system prompt for this executor (design §7.6).
+        system_prompt = ephemeral_prompt_override
     startup_skills = _parse_tui_skills_env()
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
@@ -5222,7 +5392,11 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=(
+            _channel_platform_toolsets(channel_platform) or _load_enabled_toolsets()
+            if channel_platform
+            else _load_enabled_toolsets()
+        ),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -5676,24 +5850,274 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
-    """Stash a message to run as the very next turn once the live one ends.
+# ── Shared session runtime: per-session turn FIFO ────────────────────────
+#
+# The live session record IS the Runtime Actor's embodiment (one live session
+# per canonical lineage, enforced by resume dedup + tip canonicalization).
+# These helpers add independent turn identities, a bounded in-memory FIFO and
+# accept-order sequences on top of it. The single merged ``queued_prompt``
+# slot is gone: every input keeps its own turn identity; over-capacity is an
+# explicit, retryable rejection (design §8.1).
 
-    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
-    slot is kept; a second arrival is merged (lossless, mirroring the
-    consecutive-user merge in ``repair_message_sequence``) so nothing the user
-    typed is dropped. ``transport`` is pinned so the drained turn streams back to
-    the client that sent it even if the session transport is rebound meanwhile.
+_turn_dedup = GenerationDedupTable()
+
+# Desktop-authority 连接的进程级登记表：channel-origin 的 turn 生命周期事件
+# 会广播给所有 Desktop 连接（即使该 Session 没有任何 Desktop subscriber），
+# 让桌面在页面未打开时也能凭事件 envelope 的 lineage/stored ref 创建或刷新
+# Task snapshot（design §13.4）。mid-turn 流事件不广播——只有打开会话的
+# 订阅者才需要 delta。
+_desktop_observer_transports: "set" = set()
+
+
+def register_desktop_observer(transport) -> None:
+    if transport is not None:
+        _desktop_observer_transports.add(transport)
+
+
+def unregister_desktop_observer(transport) -> None:
+    _desktop_observer_transports.discard(transport)
+
+
+def _broadcast_channel_turn_event(kind: str, sid: str, payload: dict) -> None:
+    session = _sessions.get(sid)
+    already = {id(t) for t in _session_event_targets(session)} if session else set()
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"type": kind, "session_id": sid, "payload": payload},
+    }
+    for transport in list(_desktop_observer_transports):
+        if id(transport) in already:
+            continue
+        try:
+            transport.write(frame)
+        except Exception:
+            pass
+
+
+def _turn_state(session: dict) -> SessionTurnState:
+    state = session.get("turn_state")
+    if not isinstance(state, SessionTurnState):
+        state = SessionTurnState()
+        session["turn_state"] = state
+    return state
+
+
+def _session_lineage_id(session: dict) -> str:
+    """Verified compression-lineage root for this live session (cached).
+
+    Stable across compression (the root never changes when a new tip is
+    forked), so caching on the session record is safe. Falls back to the
+    current session key when the DB is unavailable — a fresh, not-yet
+    persisted session is its own root.
     """
-    existing = session.get("queued_prompt")
-    if (
-        existing
-        and isinstance(existing.get("text"), str)
-        and isinstance(text, str)
-    ):
-        prev = existing["text"]
-        text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    cached = session.get("_lineage_id")
+    if cached:
+        return str(cached)
+    key = _session_lookup_key(session)
+    lineage = key
+    db = _get_db()
+    if db is not None and key:
+        try:
+            lineage = resolve_compression_lineage_root(db, key) or key
+        except Exception:
+            lineage = key
+    if lineage:
+        session["_lineage_id"] = lineage
+    return lineage or key
+
+
+def _emit_turn_event(kind: str, sid: str, session: dict, record: TurnRecord, extra: dict | None = None) -> None:
+    """Emit a turn.* event with the full envelope (design §7.5).
+
+    Never call while holding ``history_lock`` — the transport write can block.
+    """
+    payload = record.envelope(
+        stored_session_id=str(session.get("session_key") or record.lineage_id or ""),
+        runtime_session_id=sid,
+    )
+    payload["state"] = record.state
+    # Display projection of the submitted input (same field name as
+    # queued_snapshot's "user"). A Desktop that never submitted this turn —
+    # notably every channel-origin turn — has no local copy of the text, so
+    # the lifecycle event is its only real-time source for transcript display.
+    payload["user"] = _display_text(record.text)
+    if extra:
+        payload.update(extra)
+    _emit(kind, sid, payload)
+    if record.origin == "channel":
+        _broadcast_channel_turn_event(kind, sid, payload)
+
+
+def _new_turn_record(
+    session: dict,
+    text: Any,
+    *,
+    sequence: int,
+    origin: str = "desktop",
+    delivery_mode: str = "desktop-only",
+    client_turn_id: str = "",
+    transport: Any = None,
+    trusted_source: dict | None = None,
+    ephemeral_prompt: str | None = None,
+    auto_skills: list | None = None,
+    execution_hints: dict | None = None,
+    delivery_sink_id: str | None = None,
+    attachments: list | None = None,
+) -> TurnRecord:
+    return TurnRecord(
+        turn_id=make_turn_id(),
+        client_turn_id=client_turn_id or "",
+        sequence=sequence,
+        origin=origin,
+        delivery_mode=delivery_mode,
+        text=text,
+        profile=_current_profile_name(),
+        lineage_id=_session_lineage_id(session),
+        transport=transport,
+        trusted_source=trusted_source,
+        ephemeral_prompt=ephemeral_prompt,
+        auto_skills=auto_skills,
+        execution_hints=execution_hints,
+        delivery_sink_id=delivery_sink_id,
+        attachments=attachments,
+    )
+
+
+def _finish_active_turn(sid: str, session: dict, outcome: str | None = None) -> None:
+    """Mark the active turn terminal and emit its turn.* event.
+
+    Outcome resolution mirrors the session flags the run loop maintains:
+    ``_turn_cancel_requested`` → interrupted, ``_turn_failed`` → failed,
+    otherwise completed. Call sites: the run loop's ``finally`` tail and the
+    compute-host completion callback.
+    """
+    with session["history_lock"]:
+        state = _turn_state(session)
+        record = state.active
+        if record is None or is_terminal_turn_state(record.state):
+            return
+        resolved = outcome
+        if resolved is None:
+            if session.pop("_turn_failed", None):
+                resolved = "failed"
+            elif session.get("_turn_cancel_requested"):
+                resolved = "interrupted"
+            else:
+                resolved = "completed"
+        state.finish_active(resolved)
+    _emit_turn_event(f"turn.{record.state}", sid, session, record)
+
+
+def _prepare_turn_executor(sid: str, session: dict, record: TurnRecord) -> None:
+    """Serialize executor identity to the turn about to run (design §7.6).
+
+    The Python AIAgent object is a cache keyed by the execution signature
+    (origin + trusted channel user + ephemeral prompt + one-shot hints).
+    Adjacent turns with the same signature reuse it; a signature change tears
+    the agent down so ``_start_agent_build`` rebuilds it with this turn's
+    platform/toolsets/prompt — Desktop-origin turns never inherit Channel
+    toolsets and vice versa. History and session identity are untouched
+    (this is NOT /new).
+    """
+    trusted = record.trusted_source or {}
+    signature = (
+        record.origin,
+        str(trusted.get("user_id") or ""),
+        str(record.ephemeral_prompt or ""),
+        json.dumps(record.execution_hints or {}, sort_keys=True),
+    )
+    with session["history_lock"]:
+        previous = session.get("_executor_signature")
+        if previous == signature and session.get("agent") is not None:
+            return
+        session["_executor_signature"] = signature
+        session["_executor_platform"] = (
+            _session_source(session) if record.origin == "channel" else "desktop"
+        )
+        session["_executor_ephemeral_prompt"] = record.ephemeral_prompt or None
+        session["_executor_hints"] = dict(record.execution_hints or {})
+        session["_executor_trusted_source"] = dict(trusted) if trusted else None
+        if previous is None or session.get("agent") is None:
+            return
+        # Serial rebuild boundary: the previous turn has completed (FIFO), so
+        # discarding the cached executor here is safe.
+        session["agent"] = None
+        session["agent_build_started"] = False
+        session["agent_ready"] = threading.Event()
+
+
+def _channel_platform_toolsets(platform: str) -> list | None:
+    """Channel-origin executors resolve the platform's configured toolsets
+    (mirrors the Messaging Gateway's `_get_platform_tools`), never the
+    desktop/TUI toolset selection (design §7.6)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.tools_config import _get_platform_tools
+
+        return sorted(_get_platform_tools(load_config_readonly(), platform))
+    except Exception:
+        logger.debug("platform toolset resolution failed for %s", platform, exc_info=True)
+        return None
+
+
+def _turn_dedup_key(record: TurnRecord, authority: str | None = None) -> tuple | None:
+    if not record.client_turn_id:
+        return None
+    # The claim authority is a property of the record itself (its origin is
+    # credential-derived at submit time); deriving it here keeps claim and
+    # release symmetric — a queue-full release must free the SAME key the
+    # claim registered, or a retried client_turn_id hits a ghost record.
+    resolved = authority or ("gateway" if record.origin == "channel" else "desktop")
+    return GenerationDedupTable.key(
+        record.profile, record.lineage_id, resolved, record.client_turn_id
+    )
+
+
+def _claim_turn_dedup(record: TurnRecord, authority: str | None = None) -> TurnRecord | None:
+    """Atomically claim ``record`` in the generation-local dedup table.
+
+    Returns the previously-claimed record on duplicate (the caller must
+    discard ``record`` and answer with the original turn's identity), or
+    ``None`` when this record now owns the key. Submits without a
+    client_turn_id are not deduplicable. If the submit fails validation
+    after the claim (e.g. queue full), release via ``_release_turn_dedup``
+    so a later retry can enter the queue.
+    """
+    key = _turn_dedup_key(record, authority)
+    if key is None:
+        return None
+    return _turn_dedup.claim(key, record)
+
+
+def _release_turn_dedup(record: TurnRecord, authority: str | None = None) -> None:
+    key = _turn_dedup_key(record, authority)
+    if key is not None:
+        _turn_dedup.release(key)
+
+
+def _duplicate_turn_response(rid, session: dict, record: TurnRecord) -> dict:
+    """Answer a duplicate submit with the original turn (design §8.3)."""
+    state = _turn_state(session)
+    with session["history_lock"]:
+        queue_position = 0
+        for index, queued in enumerate(state.queue):
+            if queued.turn_id == record.turn_id:
+                queue_position = index + 1
+                break
+    return _ok(rid, {
+        "enqueued": True,
+        "duplicate": True,
+        "durability": "process",
+        "status": "duplicate",
+        "turn_id": record.turn_id,
+        "sequence": record.sequence,
+        "queue_position": queue_position,
+        "turn_state": record.state,
+        "lineage_id": record.lineage_id,
+        "stored_session_id": str(session.get("session_key") or record.lineage_id or ""),
+        "runtime_generation": RUNTIME_GENERATION,
+    })
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -5732,32 +6156,31 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any
+    rid, sid: str, session: dict, record: TurnRecord
 ) -> dict | None:
-    """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
-    a turn is in flight, instead of rejecting it with ``session busy``.
+    """Queue a turn that lands while another is in flight (real FIFO).
 
-    The old rejection forced clients into a deadline-bounded busy-retry that
-    silently dropped the send when turn teardown outlived the deadline (e.g. a
-    slow, non-interruptible tool like ``web_search`` running when the user hits
-    stop). The message is instead queued to run as the next turn — and, for the
-    default ``interrupt`` policy, the live turn is interrupted so it winds down
-    promptly. Drained in ``run``'s tail (see ``_run_prompt_submit``).
+    Every input keeps its own turn identity; over-capacity is an explicit,
+    retryable 4290 rejection — never merged, overwritten or dropped.
 
-    Modes: ``interrupt`` (default) → interrupt + queue; ``queue`` → queue
-    without interrupting; ``steer`` → inject into the live turn if accepted,
-    else queue.
+    Legacy TUI submits (no client_turn_id) keep honoring
+    ``display.busy_input_mode``: ``steer`` injects into the live turn when
+    accepted, and the default ``interrupt`` mode interrupts the live turn
+    after queueing. Identified submits (desktop turn.submit / prompt.submit
+    with client_turn_id) always take the plain FIFO path — a normal submit
+    never implicitly steers or interrupts (design §8.1/§10.2).
     """
-    mode = _load_busy_input_mode()
+    legacy = not record.client_turn_id
+    mode = _load_busy_input_mode() if legacy else "queue"
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
-    if mode == "steer" and agent is not None and hasattr(agent, "steer"):
+    if legacy and mode == "steer" and agent is not None and hasattr(agent, "steer"):
         try:
-            if agent.steer(text):
+            if agent.steer(record.text):
                 with session["history_lock"]:
                     session["last_active"] = time.time()
                 return _ok(rid, {"status": "steered"})
@@ -5769,12 +6192,37 @@ def _handle_busy_submit(
     with session["history_lock"]:
         if not session.get("running"):
             return None
-        _enqueue_prompt(session, text, transport)
+        state = _turn_state(session)
+        record.sequence = state.next_sequence()
+        try:
+            queue_position = state.enqueue(record)
+        except TurnQueueFullError as exc:
+            _release_turn_dedup(record)
+            return _err(rid, 4290, str(exc))
+        # Attachments staged for THIS input travel with its turn record; they
+        # must not be consumed by the currently-running turn or an earlier
+        # queued one (design §8.5 retention until terminal/lost).
+        staged = list(session.get("attached_images") or [])
+        if staged:
+            record.attachments = staged
+            session["attached_images"] = []
         session["last_active"] = time.time()
+    _emit_turn_event("turn.enqueued", sid, session, record, {"queue_position": queue_position})
 
-    if mode != "queue":
+    if legacy and mode != "queue":
         _interrupt_busy_session(sid, session, agent)
-    return _ok(rid, {"status": "queued"})
+    return _ok(rid, {
+        "status": "queued",
+        "enqueued": True,
+        "duplicate": False,
+        "durability": "process",
+        "turn_id": record.turn_id,
+        "sequence": record.sequence,
+        "queue_position": queue_position,
+        "lineage_id": record.lineage_id,
+        "stored_session_id": str(session.get("session_key") or record.lineage_id or ""),
+        "runtime_generation": RUNTIME_GENERATION,
+    })
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
@@ -5785,24 +6233,64 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
     with session["history_lock"]:
-        queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
+        state = _turn_state(session)
+        if session.get("running"):
             return False
-        session["queued_prompt"] = None
+        head = state.queue[0] if state.queue else None
+        if (
+            head is not None
+            and head.origin == "channel"
+            and head.transport is not None
+            and _transport_is_dead(head.transport)
+        ):
+            # The Gateway delivery sink is gone: never start a Channel-origin
+            # turn whose output cannot be delivered (design §5.6). The session
+            # FIFO pauses here; the Runtime Unit owner converges the whole
+            # Unit (gateway exit → unit failed → serve stops) shortly after.
+            return False
+        record = state.promote_next()
+        if record is None:
+            return False
         session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+        session["_turn_cancel_requested"] = False
+        # Restore the attachments staged with this turn at submit time.
+        if record.attachments:
+            session["attached_images"] = list(record.attachments) + list(session.get("attached_images") or [])
+        _start_inflight_turn(session, record.text)
+        # Desktop/TUI turns keep the historical primary-transport rebind so
+        # the drained turn streams to the client that submitted it. A
+        # channel-origin turn must NOT steal the primary transport: its
+        # submitting transport already acts as the per-turn delivery sink
+        # (write_json fans out to it while the turn is active) and Desktop
+        # observers keep their own route (design §9.2).
+        if record.transport is not None and record.origin != "channel":
+            session["transport"] = record.transport
+    _emit_turn_event("turn.started", sid, session, record)
+    _prepare_turn_executor(sid, session, record)
+    if session.get("agent") is None and not _session_uses_compute_host(session):
+        # Signature change or cold session: rebuild the executor serially
+        # before dispatching this turn (design §7.6).
+        _start_agent_build(sid, session)
+        if (err := _wait_agent(session, rid)) is not None:
+            message = str(((err.get("error") or {}).get("message")) or "agent initialization failed")
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            _emit("error", sid, {"message": message})
+            _finish_active_turn(sid, session, "failed")
+            return True
     try:
         if _session_uses_compute_host(session):
-            resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
+            resp = _submit_prompt_to_compute_host(rid, sid, session, record.text)
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
                     session["running"] = False
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
+                _finish_active_turn(sid, session, "failed")
         else:
-            _run_prompt_submit(rid, sid, session, queued["text"])
+            _run_prompt_submit(rid, sid, session, record.text)
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -5811,6 +6299,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+        _finish_active_turn(sid, session, "failed")
     return True
 
 
@@ -5831,18 +6320,32 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 
 def _queued_prompt_snapshot(session: dict) -> dict | None:
-    """Return the accepted next-turn prompt without its transport handle.
+    """Return the next queued turn's user text (legacy single-slot shape).
 
-    A busy ``prompt.submit`` lives only in ``session["queued_prompt"]`` until
-    the current turn winds down. Desktop may reconnect or restart during that
-    window, so the live-session projection must carry the user-visible text;
-    otherwise the accepted prompt disappears until it finally drains.
+    Accepted turns live only in the in-memory FIFO until the current one
+    winds down. Desktop may reconnect or restart during that window, so the
+    live-session projection must carry the user-visible text; the full FIFO
+    is exposed separately as ``queued_turns``.
     """
-    queued = session.get("queued_prompt")
-    if not isinstance(queued, dict):
+    state = session.get("turn_state")
+    if not isinstance(state, SessionTurnState) or not state.queue:
         return None
-    user = _inflight_text(queued.get("text"))
+    user = _inflight_text(state.queue[0].text)
     return {"user": user} if user else None
+
+
+def _queued_turns_snapshot(session: dict) -> list:
+    state = session.get("turn_state")
+    if not isinstance(state, SessionTurnState):
+        return []
+    return state.queued_snapshot()
+
+
+def _active_turn_snapshot(session: dict) -> dict | None:
+    state = session.get("turn_state")
+    if not isinstance(state, SessionTurnState):
+        return None
+    return state.active_snapshot()
 
 
 # ── Methods: session ─────────────────────────────────────────────────
@@ -5994,6 +6497,8 @@ def _(rid, params: dict) -> dict:
                 "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+                "capabilities": list(DESKTOP_BACKEND_CAPABILITIES),
+                "runtime_generation": RUNTIME_GENERATION,
                 "profile_name": _current_profile_name(),
             },
         },
@@ -6144,6 +6649,8 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
         "skills": {},
         "lazy": True,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "capabilities": list(DESKTOP_BACKEND_CAPABILITIES),
+        "runtime_generation": RUNTIME_GENERATION,
         "profile_name": _current_profile_name(),
     }
     if provider:
@@ -6865,6 +7372,16 @@ def _live_session_payload(
         payload["inflight"] = inflight
     if queued:
         payload["queued"] = queued
+    # Shared session runtime projections: full pending FIFO + active turn
+    # identity + the generation guard clients need to fence stale state.
+    queued_turns = _queued_turns_snapshot(session)
+    if queued_turns:
+        payload["queued_turns"] = queued_turns
+    active_turn = _active_turn_snapshot(session)
+    if active_turn:
+        payload["active_turn"] = active_turn
+    payload["runtime_generation"] = RUNTIME_GENERATION
+    payload["lineage_id"] = _session_lineage_id(session)
     return payload
 
 
@@ -6928,6 +7445,53 @@ def _(rid, params: dict) -> dict:
             transport=current_transport() or _stdio_transport,
         ),
     )
+
+
+@method("session.subscribe")
+def _(rid, params: dict) -> dict:
+    """Register the calling transport as an OBSERVER of a live session.
+
+    Unlike ``session.activate`` this never rebinds the session's primary
+    transport and never touches anyone's reply sink: a Desktop window watching
+    a Channel conversation receives every event without stealing the Gateway's
+    delivery route (design §9.1/§9.2). Subscriptions are connection-scoped and
+    die with the transport; they are process-local and do not survive a
+    runtime generation change.
+
+    Returns the same live snapshot as ``session.activate`` so the subscriber
+    can render current state (messages / inflight / queued turns) before the
+    next event arrives.
+    """
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4034, "session.subscribe requires a connection-bound transport")
+    subscribers = session.get("subscribers")
+    if not isinstance(subscribers, dict):
+        subscribers = {}
+        session["subscribers"] = subscribers
+    subscription_id = f"sub-{uuid.uuid4().hex[:12]}"
+    subscribers[subscription_id] = transport
+    payload = _live_session_payload(sid, session, touch=False, transport=None)
+    payload["subscription_id"] = subscription_id
+    return _ok(rid, payload)
+
+
+@method("session.unsubscribe")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    subscription_id = str(params.get("subscription_id") or "")
+    subscribers = session.get("subscribers")
+    removed = False
+    if isinstance(subscribers, dict):
+        removed = subscribers.pop(subscription_id, None) is not None
+    return _ok(rid, {"removed": removed})
 
 
 @method("session.delete")
@@ -9234,11 +9798,47 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
 
 
+def _validate_interrupt_target(rid, session: dict, params: dict) -> dict | None:
+    """Directed interrupt validation (design §10.2).
+
+    A caller that names a turn/generation must hit the CURRENT active turn —
+    interrupting a completed turn or one from an older runtime generation is
+    an explicit stale error, never a silent no-op against the wrong turn.
+    Legacy calls without turn scoping stay valid (TUI /stop).
+    """
+    wanted_generation = str(params.get("runtime_generation") or "")
+    if wanted_generation and wanted_generation != RUNTIME_GENERATION:
+        return _err(rid, 4033, "stale runtime generation — turn no longer interruptible")
+    wanted_turn = str(params.get("turn_id") or "")
+    if wanted_turn:
+        state = _turn_state(session)
+        with session["history_lock"]:
+            active = state.active
+            if active is None or is_terminal_turn_state(active.state) or active.turn_id != wanted_turn:
+                return _err(rid, 4033, "stale turn — not the active turn")
+    return None
+
+
+def _drop_queued_turns_for_interrupt(sid: str, session: dict, params: dict) -> None:
+    """Legacy un-scoped interrupt clears the pending FIFO (TUI /stop keeps its
+    historical meaning); a turn-scoped interrupt only stops the named active
+    turn and leaves queued turns waiting."""
+    if str(params.get("turn_id") or ""):
+        return
+    with session["history_lock"]:
+        dropped = _turn_state(session).drop_queued("interrupted")
+    for record in dropped:
+        _emit_turn_event("turn.interrupted", sid, session, record, {"reason": "queue-cleared"})
+
+
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    stale = _validate_interrupt_target(rid, session, params)
+    if stale is not None:
+        return stale
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
         if session.get("running"):
@@ -9248,7 +9848,7 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
         with session["history_lock"]:
             session["_turn_cancel_requested"] = True
-            session["queued_prompt"] = None
+        _drop_queued_turns_for_interrupt(sid, session, params)
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -9274,12 +9874,13 @@ def _(rid, params: dict) -> dict:
         session["agent"].interrupt()
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
-        session["queued_prompt"] = None
+    _drop_queued_turns_for_interrupt(str(params.get("session_id") or ""), session, params)
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
+        _finish_active_turn(str(params.get("session_id") or ""), session, "interrupted")
 
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,
@@ -9576,21 +10177,55 @@ def _(rid, params: dict) -> dict:
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+    # or fallback moved the session transport to stdio. The Gateway Runtime
+    # Client is a per-turn delivery sink, never the session's primary
+    # transport — Desktop observers keep their route (design §9.2).
+    t = current_transport()
+    if t is not None and getattr(t, "authority", "") == "gateway-service":
+        t_primary = None
+    else:
+        t_primary = t
+    if t_primary is not None:
+        session["transport"] = t_primary
+    # Allocate the turn identity and claim generation-local dedup BEFORE the
+    # busy/idle race: a retried client_turn_id must answer with the original
+    # turn instead of creating a second one (design §8.3). The lineage lookup
+    # happens here, outside history_lock.
+    client_turn_id = str(params.get("client_turn_id") or "")
+    # Channel execution context rides in only on the Gateway Runtime Client
+    # authority (turn.submit delegation); a desktop credential can never
+    # smuggle a trusted channel identity (design §5.2/§7.2).
+    channel_turn = None
+    if getattr(current_transport(), "authority", "") == "gateway-service":
+        raw_channel = params.get("_channel_turn")
+        if isinstance(raw_channel, dict):
+            channel_turn = raw_channel
+    record = _new_turn_record(
+        session,
+        text,
+        sequence=0,
+        client_turn_id=client_turn_id,
+        transport=t or session.get("transport"),
+        origin="channel" if channel_turn is not None else "desktop",
+        delivery_mode=str((channel_turn or {}).get("delivery_mode") or "desktop-only"),
+        trusted_source=(channel_turn or {}).get("trusted_source"),
+        ephemeral_prompt=(channel_turn or {}).get("ephemeral_prompt"),
+        auto_skills=(channel_turn or {}).get("auto_skills"),
+        execution_hints=(channel_turn or {}).get("execution_hints"),
+        delivery_sink_id=(channel_turn or {}).get("delivery_sink_id"),
+    )
+    duplicate = _claim_turn_dedup(record)
+    if duplicate is not None:
+        return _duplicate_turn_response(rid, session, duplicate)
     while True:
-        busy_transport = None
         with session["history_lock"]:
-            if session.get("running"):
-                # Don't reject a mid-turn prompt — queue it (and, by default,
-                # interrupt the live turn) so it runs as the next turn. The
-                # provider interrupt itself must happen after this lock is
-                # released: a non-interruptible tool may keep it waiting.
-                busy_transport = t or session.get("transport")
-            else:
+            if not session.get("running"):
                 break
-        busy_response = _handle_busy_submit(rid, sid, session, text, busy_transport)
+            # Don't reject a mid-turn prompt — queue it as an independent turn
+            # in the session FIFO. Legacy (no client_turn_id) submits keep the
+            # busy_input_mode interrupt/steer behaviors; the provider interrupt
+            # itself must happen after this lock is released.
+        busy_response = _handle_busy_submit(rid, sid, session, record)
         if busy_response is not None:
             return busy_response
         # The old turn finished between the two lock acquisitions. Retry the
@@ -9604,11 +10239,13 @@ def _(rid, params: dict) -> dict:
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+            _release_turn_dedup(record)
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
             except (TypeError, ValueError):
+                _release_turn_dedup(record)
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
             user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
@@ -9618,6 +10255,7 @@ def _(rid, params: dict) -> dict:
             # truncating history to everything before it and persisting that loss
             # via replace_messages — an unrecoverable overwrite of the session DB.
             if ordinal < 0 or ordinal >= len(user_indices):
+                _release_turn_dedup(record)
                 return _err(rid, 4018, "target user message is no longer in session history")
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
@@ -9631,10 +10269,24 @@ def _(rid, params: dict) -> dict:
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
+        state = _turn_state(session)
+        record.sequence = state.next_sequence()
+        state.activate(record)
+
+    _emit_turn_event("turn.enqueued", sid, session, record, {"queue_position": 0})
+    _emit_turn_event("turn.started", sid, session, record)
+    _prepare_turn_executor(sid, session, record)
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
         if not isolated_response.get("error"):
+            if isinstance(isolated_response.get("result"), dict):
+                isolated_response["result"].update({
+                    "turn_id": record.turn_id,
+                    "sequence": record.sequence,
+                    "lineage_id": record.lineage_id,
+                    "runtime_generation": RUNTIME_GENERATION,
+                })
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
@@ -9644,6 +10296,10 @@ def _(rid, params: dict) -> dict:
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
+    # Channel conversations stamp their routing peer identity onto the row so
+    # (profile, source, source_session_key) resolve-or-create stays stable
+    # across gateway restarts and lost routing indexes (design §7.2).
+    _stamp_channel_peer(session)
     # A branch becomes real here: copy its parent's transcript into the row so it
     # resumes with full context (the agent won't persist the seed itself).
     _persist_branch_seed(session)
@@ -9664,12 +10320,18 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 _clear_inflight_turn(session)
+            _finish_active_turn(sid, session, "failed")
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
-                return
+                cancelled = True
+            else:
+                cancelled = False
+        if cancelled:
+            _finish_active_turn(sid, session, "interrupted")
+            return
         _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
@@ -9677,7 +10339,241 @@ def _(rid, params: dict) -> dict:
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
     run_thread.start()
-    return _ok(rid, {"status": "streaming"})
+    return _ok(rid, {
+        "status": "streaming",
+        "enqueued": True,
+        "duplicate": False,
+        "durability": "process",
+        "turn_id": record.turn_id,
+        "sequence": record.sequence,
+        "queue_position": 0,
+        "lineage_id": record.lineage_id,
+        "stored_session_id": str(session.get("session_key") or record.lineage_id or ""),
+        "runtime_generation": RUNTIME_GENERATION,
+    })
+
+
+def _resolve_turn_session(rid, stored_id: str):
+    """Resolve a caller-provided session ref (old root / old segment / current
+    tip) to the canonical lineage's single live actor session, cold-resuming
+    when necessary. Returns ``(sid, session)`` or an error response dict.
+
+    All refs of one lineage converge on one live session: live lookup by the
+    raw ref, then by the DB-canonicalized tip, then a deferred resume whose
+    ``_claim_or_reuse_live`` dedups a concurrent winner (design §5.1).
+    """
+    with _session_resume_lock:
+        live = _find_live_session_by_key(stored_id)
+        if live is not None:
+            return live
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5000)
+    found = db.get_session(stored_id)
+    tip = stored_id
+    if found:
+        try:
+            tip = db.resolve_resume_session_id(stored_id) or stored_id
+        except Exception:
+            tip = stored_id
+    if tip != stored_id:
+        with _session_resume_lock:
+            live = _find_live_session_by_key(tip)
+            if live is not None:
+                return live
+    if not found:
+        return _err(rid, 4007, "session not found")
+    resume_resp = _methods["session.resume"](rid, {
+        "session_id": tip,
+        "close_on_disconnect": False,
+    })
+    if resume_resp.get("error"):
+        return resume_resp
+    resumed_sid = str((resume_resp.get("result") or {}).get("session_id") or "")
+    with _sessions_lock:
+        session = _sessions.get(resumed_sid)
+    if session is None:
+        return _err(rid, 5000, "resumed session vanished before turn dispatch")
+    return resumed_sid, session
+
+
+def _resolve_channel_conversation(rid, source: str, source_session_key: str):
+    """Resolve-or-create the Channel conversation for a trusted opaque key.
+
+    The same ``(profile, source, source_session_key)`` must always converge on
+    one lineage — concurrent or crash-retried submits included (design §7.2).
+    Resolution order: durable peer row (sessions.session_key column, the same
+    index the Messaging Gateway's recovery uses) → canonical tip → live actor;
+    otherwise create a fresh session carrying the platform source. The peer
+    identity is stamped onto the durable row at first persist so a later
+    routing loss can rebuild the mapping.
+    """
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5000)
+    row = None
+    try:
+        row = db.find_latest_gateway_session_for_peer(
+            source=source, session_key=source_session_key
+        )
+    except Exception:
+        row = None
+    if row and row.get("id"):
+        resolved = _resolve_turn_session(rid, str(row["id"]))
+        if isinstance(resolved, dict):
+            return resolved
+        sid, session = resolved
+        session.setdefault("_channel_peer", {"source": source, "session_key": source_session_key})
+        return sid, session
+    create_resp = _methods["session.create"](rid, {
+        "source": source,
+        "close_on_disconnect": False,
+    })
+    if create_resp.get("error"):
+        return create_resp
+    created_sid = str((create_resp.get("result") or {}).get("session_id") or "")
+    with _sessions_lock:
+        session = _sessions.get(created_sid)
+    if session is None:
+        return _err(rid, 5000, "channel session vanished before turn dispatch")
+    session["_channel_peer"] = {"source": source, "session_key": source_session_key}
+    return created_sid, session
+
+
+def _stamp_channel_peer(session: dict) -> None:
+    """Persist the channel routing peer onto the durable session row (once)."""
+    peer = session.get("_channel_peer")
+    if not isinstance(peer, dict) or session.get("_channel_peer_stamped"):
+        return
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        db.record_gateway_session_peer(
+            str(session.get("session_key") or ""),
+            source=str(peer.get("source") or ""),
+            session_key=str(peer.get("session_key") or ""),
+        )
+        session["_channel_peer_stamped"] = True
+    except Exception:
+        logger.debug("channel peer stamp failed", exc_info=True)
+
+
+_EXECUTION_HINT_ALLOWLIST = frozenset({
+    "model", "provider", "reasoning_effort", "service_tier", "max_iterations",
+})
+
+
+def _filter_execution_hints(raw) -> dict | None:
+    """Allowlisted, non-secret one-shot overrides only (design §7.2): never an
+    API key, base URL, or arbitrary tool name."""
+    if not isinstance(raw, dict):
+        return None
+    hints = {}
+    for key, value in raw.items():
+        if key not in _EXECUTION_HINT_ALLOWLIST:
+            continue
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            hints[key] = str(value).strip() if isinstance(value, str) else value
+    return hints or None
+
+
+@method("turn.submit")
+def _(rid, params: dict) -> dict:
+    """Transport-neutral turn submission (shared session runtime, design §7).
+
+    Desktop and (from M3) the Messaging Gateway submit turns through this one
+    entry; the model/tool execution owner is always this serve process. The
+    submit resolves the conversation to the canonical lineage actor, claims
+    generation-local clientTurnId dedup, and enters the bounded per-session
+    FIFO — then delegates to the same internal execution path prompt.submit
+    uses, so there is exactly one coordinator.
+    """
+    profile = str(params.get("profile") or "").strip()
+    current_profile = _current_profile_name()
+    if profile and profile != current_profile:
+        return _err(rid, 4032, f"profile mismatch: this serve owns '{current_profile}'")
+    client_turn_id = str(params.get("client_turn_id") or "")
+    if not client_turn_id:
+        return _err(rid, 4032, "client_turn_id required")
+    raw_text = params.get("message", "")
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return _err(rid, 4032, "message required")
+    delivery_mode = str(params.get("delivery_mode") or "desktop-only")
+    if delivery_mode not in ("desktop-only", "origin-channel"):
+        return _err(rid, 4032, "invalid delivery_mode")
+    busy_mode = str(params.get("busy_mode") or "fifo")
+    if busy_mode != "fifo":
+        return _err(rid, 4032, "busy_mode must be 'fifo'")
+    conversation = params.get("conversation") or {}
+    kind = str(conversation.get("kind") or "stored")
+    # Origin/authority derive from the entry credential, never the payload
+    # (design §5.2): the dashboard token/ticket is the desktop authority;
+    # the per-Unit service credential marks the Gateway Runtime Client.
+    authority = getattr(current_transport(), "authority", "desktop")
+    if authority == "gateway-service":
+        # Gateway entry: origin=channel is forced, replies go to the origin
+        # channel, and the trusted execution context is accepted (§7.2).
+        if delivery_mode != "origin-channel":
+            return _err(rid, 4032, "gateway submits must use delivery_mode origin-channel")
+        trusted_source = params.get("trusted_source")
+        if trusted_source is not None and not isinstance(trusted_source, dict):
+            return _err(rid, 4032, "invalid trusted_source")
+        channel_turn = {
+            "delivery_mode": "origin-channel",
+            "trusted_source": trusted_source,
+            "ephemeral_prompt": str(params.get("ephemeral_prompt") or "") or None,
+            "auto_skills": params.get("auto_skills") if isinstance(params.get("auto_skills"), list) else None,
+            "execution_hints": _filter_execution_hints(params.get("execution_hints")),
+            "delivery_sink_id": str(params.get("delivery_sink_id") or "") or None,
+        }
+        if kind == "channel-create":
+            source = str(conversation.get("source") or "").strip()
+            source_session_key = str(conversation.get("source_session_key") or "").strip()
+            if not source or not source_session_key:
+                return _err(rid, 4032, "channel-create requires source and source_session_key")
+            resolved = _resolve_channel_conversation(rid, source, source_session_key)
+        elif kind == "stored":
+            stored_id = str(conversation.get("stored_session_id") or "")
+            if not stored_id:
+                return _err(rid, 4032, "conversation.stored_session_id required")
+            resolved = _resolve_turn_session(rid, stored_id)
+        else:
+            return _err(rid, 4032, f"unknown conversation.kind: {kind}")
+    else:
+        # Desktop entry: desktop-only delivery is forced; a desktop credential
+        # cannot construct a trusted channel context or a channel conversation.
+        if kind != "stored":
+            return _err(rid, 4031, "conversation.kind requires the gateway runtime client")
+        if delivery_mode != "desktop-only" or params.get("trusted_source") or params.get("delivery_sink_id"):
+            return _err(rid, 4031, "channel delivery requires the gateway runtime client")
+        channel_turn = None
+        stored_id = str(conversation.get("stored_session_id") or "")
+        if not stored_id:
+            return _err(rid, 4032, "conversation.stored_session_id required")
+        resolved = _resolve_turn_session(rid, stored_id)
+
+    if isinstance(resolved, dict):
+        return resolved
+    sid, session = resolved
+
+    delegate_params = {
+        "session_id": sid,
+        "text": raw_text,
+        "client_turn_id": client_turn_id,
+    }
+    if channel_turn is not None:
+        delegate_params["_channel_turn"] = channel_turn
+    resp = _methods["prompt.submit"](rid, delegate_params)
+    if resp.get("error"):
+        return resp
+    result = dict(resp.get("result") or {})
+    result.setdefault("enqueued", True)
+    result.setdefault("durability", "process")
+    result.setdefault("duplicate", False)
+    result["runtime_session_id"] = sid
+    result.setdefault("runtime_generation", RUNTIME_GENERATION)
+    return _ok(rid, result)
 
 
 def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
@@ -10541,6 +11437,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
             _emit("error", sid, {"message": str(e)})
+            # Resolve this turn's terminal state as failed (picked up by
+            # _finish_active_turn in the finally tail below).
+            session["_turn_failed"] = True
         finally:
             if one_turn_restore:
                 try:
@@ -10565,6 +11464,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["running"] = False
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
+            # Terminal turn state (completed / interrupted / failed) resolves
+            # from the session flags this run loop maintained; must precede the
+            # FIFO drain below, which promotes the next queued turn to active.
+            _finish_active_turn(sid, session)
             _emit("session.info", sid, _session_info(agent, session))
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over

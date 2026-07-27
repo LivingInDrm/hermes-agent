@@ -16823,6 +16823,14 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
         return None, "token"
+    # Gateway Runtime Client service credential (shared session runtime,
+    # design §11.1): the Desktop-owned Runtime Unit mints a separate
+    # per-Unit credential for the Messaging Gateway child so serve can
+    # distinguish the Gateway service authority from the Desktop dashboard
+    # authority on the same loopback listener — never from payload fields.
+    service_token = os.environ.get("HERMES_GATEWAY_SERVICE_TOKEN", "")
+    if service_token and hmac.compare_digest(token.encode(), service_token.encode()):
+        return None, "gateway-service"
     return "token_mismatch", "token"
 
 
@@ -17910,7 +17918,8 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    reason, credential = _ws_auth_reason(ws)
+    if reason is not None:
         await ws.close(code=4401)
         return
 
@@ -17920,7 +17929,10 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    # The connection authority derives from WHICH credential authenticated,
+    # never from payload fields (design §5.2/§11.1). "gateway-service" marks
+    # the Messaging Gateway Runtime Client; everything else is desktop.
+    await handle_ws(ws, authority="gateway-service" if credential == "gateway-service" else "desktop")
 
 
 # ---------------------------------------------------------------------------
@@ -19585,6 +19597,15 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
+            # Externally supervised backend (Desktop Runtime Unit): die with
+            # the declared parent so a force-killed supervisor never leaves an
+            # orphan serve (HERMES_PARENT_PID; no-op otherwise).
+            try:
+                from hermes_cli.parent_liveness import start_parent_liveness_guard
+
+                start_parent_liveness_guard(role="serve")
+            except Exception:
+                pass
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
