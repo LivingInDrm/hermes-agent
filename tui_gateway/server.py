@@ -2463,11 +2463,19 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
         _pending_prompt_payloads[rid] = (event, dict(payload))
+    # A clarify raised inside a channel-origin turn has no interactive owner
+    # on the regular event targets (primary + sink are the Messaging
+    # Gateway): broadcast it to desktop observers too, so the shared-session
+    # Desktop page can answer (clarify.respond is request_id-keyed — first
+    # responder wins). Secret/sudo prompts are intentionally NOT broadcast.
+    clarify_broadcast = event == "clarify.request" and _active_turn_origin(sid) == "channel"
     answered = False
     answer = ""
     answer_present = False
     try:
         _emit(event, sid, payload)
+        if clarify_broadcast:
+            _broadcast_channel_turn_event(event, sid, dict(payload))
         answered = ev.wait(timeout=timeout)
     finally:
         with _prompt_lock:
@@ -2482,7 +2490,29 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
             sid,
             {"request_id": rid},
         )
+    if event == "clarify.request":
+        # Resolution fan-out (answered anywhere / timeout): every surface
+        # drops its stale prompt, and the Gateway relay releases its pending
+        # entry so the next channel message is not swallowed as an answer.
+        _emit("clarify.expire", sid, {"request_id": rid})
+        if clarify_broadcast:
+            _broadcast_channel_turn_event("clarify.expire", sid, {"request_id": rid})
     return answer
+
+
+def _active_turn_origin(sid: str) -> str:
+    """Origin of the session's active turn ("desktop" | "channel" | "")."""
+    session = _sessions.get(sid)
+    if not isinstance(session, dict):
+        return ""
+    try:
+        with session["history_lock"]:
+            record = _turn_state(session).active
+    except Exception:
+        return ""
+    if record is None or is_terminal_turn_state(record.state):
+        return ""
+    return str(record.origin or "")
 
 
 def _clear_pending(sid: str | None = None) -> None:

@@ -137,6 +137,10 @@ class GatewayRuntimeClient:
         logger: Optional[logging.Logger] = None,
         on_delta: Optional[Callable[["RuntimeTurnHandle", str], None]] = None,
         on_tip_updated: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_clarify_request: Optional[
+            Callable[["RuntimeTurnHandle", Dict[str, Any]], None]
+        ] = None,
+        on_clarify_expire: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self._url = url
         self._token = token
@@ -145,8 +149,16 @@ class GatewayRuntimeClient:
         # Optional callbacks: on_delta(handle, text) fires per message.delta
         # chunk; on_tip_updated(payload) fires on session.tip.updated (the
         # runner uses it to keep gateway routing in sync with serve's tip).
+        # on_clarify_request(handle, payload) fires when serve raises an
+        # interactive clarify prompt inside a delegated turn — the runner
+        # relays it to the origin channel and answers via respond_clarify
+        # (without this the serve-side clarify blocks until timeout with the
+        # question invisible to everyone). on_clarify_expire(payload) fires
+        # when the prompt resolved elsewhere or timed out.
         self.on_delta = on_delta
         self.on_tip_updated = on_tip_updated
+        self.on_clarify_request = on_clarify_request
+        self.on_clarify_expire = on_clarify_expire
 
         self._session: Any = None
         self._ws: Any = None
@@ -305,6 +317,17 @@ class GatewayRuntimeClient:
                 f"{method} timed out after {timeout:.0f}s"
             ) from None
 
+    async def respond_clarify(self, request_id: str, answer: str) -> Any:
+        """Forward a channel user's clarify answer to serve (request_id-keyed).
+
+        First responder wins on the serve side (`clarify.respond` resolves the
+        pending prompt once); a stale answer gets a 4009 error — callers treat
+        that as "someone else already answered", not a failure.
+        """
+        return await self.request(
+            "clarify.respond", {"request_id": request_id, "answer": answer}
+        )
+
     async def submit_turn(
         self,
         params: Dict[str, Any],
@@ -404,6 +427,18 @@ class GatewayRuntimeClient:
                     )
             return
 
+        if event_type == "clarify.expire":
+            # request_id-keyed; delivered even when no local turn handle is
+            # tracked anymore (the prompt may outlive the turn bookkeeping).
+            if self.on_clarify_expire is not None:
+                try:
+                    self.on_clarify_expire(payload)
+                except Exception:
+                    self._logger.exception(
+                        "runtime client: on_clarify_expire callback failed"
+                    )
+            return
+
         # Mid-turn events attribute via the `turn` sibling key; terminal
         # turn.* events also carry turn_id in their payload.
         turn_id = str(turn_info.get("turn_id") or payload.get("turn_id") or "")
@@ -411,6 +446,16 @@ class GatewayRuntimeClient:
             return
         handle = self._turns.get(turn_id)
         if handle is None:
+            return
+
+        if event_type == "clarify.request":
+            if self.on_clarify_request is not None:
+                try:
+                    self.on_clarify_request(handle, payload)
+                except Exception:
+                    self._logger.exception(
+                        "runtime client: on_clarify_request callback failed"
+                    )
             return
 
         if event_type == "message.delta":

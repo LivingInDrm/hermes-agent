@@ -373,6 +373,161 @@ class TestGatewayRuntimeClientFrames:
 # ---------------------------------------------------------------------------
 
 
+class TestRuntimeClarifyRelay:
+    """serve 在委托 turn 内发起的 clarify 中继回原渠道（能力回归修复）：
+    旧路径的 clarify → 渠道按钮/文本 → 拦截回答；委托后经 clarify.respond
+    RPC 回给 serve。expire 必须清掉挂起项，防止吞掉下一条渠道消息。"""
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        from tools import clarify_gateway
+
+        yield
+        clarify_gateway.clear_session("relay-sess")
+
+    @pytest.mark.asyncio
+    async def test_clarify_frames_route_to_callbacks(self):
+        seen = {}
+        client = GatewayRuntimeClient(
+            "ws://x/api/ws",
+            "tok",
+            on_clarify_request=lambda handle, payload: seen.update(
+                request=(handle.turn_id, dict(payload))
+            ),
+            on_clarify_expire=lambda payload: seen.update(expire=dict(payload)),
+        )
+        loop = asyncio.get_running_loop()
+        client._turns["t-c"] = RuntimeTurnHandle(turn_id="t-c", future=loop.create_future())
+
+        client.handle_frame(_event(
+            "clarify.request",
+            {"request_id": "rid-1", "question": "哪种？", "choices": ["A", "B"]},
+            _turn_key("t-c"),
+        ))
+        assert seen["request"][0] == "t-c"
+        assert seen["request"][1]["question"] == "哪种？"
+
+        # expire 不依赖 turn 归属（prompt 生命周期可长于 turn 记账）。
+        client.handle_frame(_event("clarify.expire", {"request_id": "rid-1"}))
+        assert seen["expire"] == {"request_id": "rid-1"}
+
+    @pytest.mark.asyncio
+    async def test_relay_presents_prompt_and_forwards_answer(self):
+        from tools import clarify_gateway
+        from gateway.runtime_clarify import relay_clarify_request
+
+        responded = {}
+
+        class _FakeClient:
+            async def respond_clarify(self, request_id, answer):
+                responded.update(request_id=request_id, answer=answer)
+                return {"status": "ok"}
+
+        sent = {}
+
+        class _FakeAdapter:
+            def pause_typing_for_chat(self, chat_id):
+                sent["paused"] = chat_id
+
+            async def send_clarify(self, **kwargs):
+                sent.update(kwargs)
+                return SimpleNamespace(success=True)
+
+        armed = relay_clarify_request(
+            payload={"request_id": "rid-2", "question": "去哪？", "choices": None},
+            session_key="relay-sess",
+            adapter=_FakeAdapter(),
+            chat_id="chat-9",
+            metadata={"thread": "t"},
+            loop=asyncio.get_running_loop(),
+            client=_FakeClient(),
+        )
+        assert armed is True
+        await asyncio.sleep(0)  # 让 send 任务运行
+        assert sent["clarify_id"] == "rid-2"
+        assert sent["question"] == "去哪？"
+        # 渠道用户下一条消息经既有拦截解析（此处直接解析入口）。
+        assert clarify_gateway.resolve_text_response_for_session("relay-sess", "东京") is True
+        for _ in range(100):
+            if responded:
+                break
+            await asyncio.sleep(0.05)
+        assert responded == {"request_id": "rid-2", "answer": "东京"}
+
+    @pytest.mark.asyncio
+    async def test_send_failure_releases_pending_without_respond(self):
+        from tools import clarify_gateway
+        from gateway.runtime_clarify import relay_clarify_request
+
+        responded = {}
+
+        class _FakeClient:
+            async def respond_clarify(self, request_id, answer):
+                responded.update(request_id=request_id)
+                return {"status": "ok"}
+
+        class _FailingAdapter:
+            def pause_typing_for_chat(self, chat_id):
+                pass
+
+            async def send_clarify(self, **kwargs):
+                return SimpleNamespace(success=False)
+
+        relay_clarify_request(
+            payload={"request_id": "rid-3", "question": "q"},
+            session_key="relay-sess",
+            adapter=_FailingAdapter(),
+            chat_id="chat-9",
+            metadata=None,
+            loop=asyncio.get_running_loop(),
+            client=_FakeClient(),
+        )
+        await asyncio.sleep(0.05)
+        # 发送失败：挂起项必须释放（否则下一条渠道消息会被吞成回答），
+        # 且不得向 serve 发送空答案。
+        for _ in range(100):
+            if clarify_gateway.get_pending_for_session("relay-sess", include_choice_prompts=True) is None:
+                break
+            await asyncio.sleep(0.05)
+        assert clarify_gateway.get_pending_for_session("relay-sess", include_choice_prompts=True) is None
+        assert responded == {}
+
+    @pytest.mark.asyncio
+    async def test_expire_clears_pending(self):
+        from tools import clarify_gateway
+        from gateway.runtime_clarify import relay_clarify_expire, relay_clarify_request
+
+        class _FakeClient:
+            async def respond_clarify(self, request_id, answer):
+                return {"status": "ok"}
+
+        class _FakeAdapter:
+            def pause_typing_for_chat(self, chat_id):
+                pass
+
+            async def send_clarify(self, **kwargs):
+                return SimpleNamespace(success=True)
+
+        relay_clarify_request(
+            payload={"request_id": "rid-4", "question": "q", "choices": ["A"]},
+            session_key="relay-sess",
+            adapter=_FakeAdapter(),
+            chat_id="chat-9",
+            metadata=None,
+            loop=asyncio.get_running_loop(),
+            client=_FakeClient(),
+        )
+        await asyncio.sleep(0)
+        assert clarify_gateway.get_pending_for_session("relay-sess", include_choice_prompts=True) is not None
+        # Desktop 抢答/serve 超时 → expire 广播 → 挂起项清除。
+        relay_clarify_expire({"request_id": "rid-4"})
+        for _ in range(100):
+            if clarify_gateway.get_pending_for_session("relay-sess", include_choice_prompts=True) is None:
+                break
+            await asyncio.sleep(0.05)
+        assert clarify_gateway.get_pending_for_session("relay-sess", include_choice_prompts=True) is None
+
+
 class TestRuntimeDelegateEnabledFor:
     def test_default_off(self, monkeypatch):
         _set_runtime_env(monkeypatch)

@@ -18677,9 +18677,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise RuntimeError("runtime delegation endpoint is not configured")
         from gateway.runtime_client import GatewayRuntimeClient
         url, token = endpoint
-        client = GatewayRuntimeClient(url, token, logger=logger)
+        client = GatewayRuntimeClient(
+            url,
+            token,
+            logger=logger,
+            on_clarify_request=self._on_runtime_clarify_request,
+            on_clarify_expire=self._on_runtime_clarify_expire,
+        )
         self._runtime_client = client
         return client
+
+    def _on_runtime_clarify_request(self, handle, payload) -> None:
+        """Serve raised a clarify prompt inside a delegated turn — relay it
+        to the origin channel via the legacy clarify bridge (design §7.5;
+        without this the prompt is invisible and serve blocks to timeout)."""
+        ctx_map = getattr(self, "_runtime_clarify_ctx", None) or {}
+        ctx = ctx_map.get(getattr(handle, "turn_id", ""))
+        if ctx is None:
+            logger.warning(
+                "runtime clarify: no channel context for turn %s — prompt not relayed",
+                getattr(handle, "turn_id", "?"),
+            )
+            return
+        from gateway.runtime_clarify import relay_clarify_request
+
+        relay_clarify_request(
+            payload=payload,
+            session_key=ctx["session_key"],
+            adapter=ctx["adapter"],
+            chat_id=ctx["chat_id"],
+            metadata=ctx["metadata"],
+            loop=ctx["loop"],
+            client=self._get_runtime_client(),
+            logger=logger,
+        )
+
+    def _on_runtime_clarify_expire(self, payload) -> None:
+        from gateway.runtime_clarify import relay_clarify_expire
+
+        relay_clarify_expire(payload, logger)
 
     async def _run_turn_via_runtime(
         self,
@@ -18944,6 +18980,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if session_key:
             handles_map.setdefault(session_key, {})[handle.turn_id] = handle
 
+        # Channel context for mid-turn interactive prompts (clarify relay):
+        # the runtime client's reader task looks this up by turn_id when a
+        # clarify.request event arrives for this delegated turn.
+        clarify_ctx = getattr(self, "_runtime_clarify_ctx", None)
+        if clarify_ctx is None:
+            clarify_ctx = {}
+            self._runtime_clarify_ctx = clarify_ctx
+        clarify_ctx[handle.turn_id] = {
+            "session_key": session_key or "",
+            "adapter": _adapter,
+            "chat_id": source.chat_id or "",
+            "metadata": self._thread_metadata_for_source(source, event_message_id),
+            "loop": asyncio.get_running_loop(),
+        }
+
         try:
             # Generous per-turn budget matching inline turn budgets. shield()
             # keeps the handle future usable by the client on timeout.
@@ -18974,6 +19025,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         handles_map.pop(session_key, None)
                 except Exception:
                     pass
+            try:
+                clarify_ctx.pop(handle.turn_id, None)
+            except Exception:
+                pass
 
         if not _run_still_current():
             logger.info(

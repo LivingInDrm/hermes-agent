@@ -248,6 +248,71 @@ def test_channel_queue_full_release_frees_gateway_authority_claim(server, monkey
     assert accepted["result"]["status"] == "queued"
 
 
+def test_channel_turn_clarify_broadcasts_to_desktop_and_expires(server):
+    """channel-origin turn 内的 clarify.request 广播给 desktop 观察者（常规
+    事件目标都是 Gateway，桌面否则永远看不到提问）；应答/超时后广播
+    clarify.expire 让各端清掉挂起提示。desktop-origin turn 不广播。"""
+    import threading as _threading
+    import time as _time
+
+    desktop = _FakeTransport("desktop-anywhere")
+    server.register_desktop_observer(desktop)
+    try:
+        gateway_sink = _FakeTransport("gateway")
+        session = _session(server, "sid-clarify", transport=gateway_sink, session_key="chan-tip")
+        _activate_channel_turn(server, session, gateway_sink)
+
+        result = {}
+
+        def _run_block():
+            result["answer"] = server._block(
+                "clarify.request", "sid-clarify",
+                {"question": "哪一种？", "choices": ["A", "B"]}, timeout=10,
+            )
+
+        worker = _threading.Thread(target=_run_block)
+        worker.start()
+        for _ in range(200):
+            if any(f["params"]["type"] == "clarify.request" for f in desktop.frames):
+                break
+            _time.sleep(0.01)
+        request_frames = [f for f in desktop.frames if f["params"]["type"] == "clarify.request"]
+        assert len(request_frames) == 1
+        payload = request_frames[0]["params"]["payload"]
+        assert payload["question"] == "哪一种？"
+        rid = payload["request_id"]
+        assert rid
+
+        # 桌面应答（request_id 键控，先到先得）。
+        resp = server.handle_request({
+            "id": "r-ans", "method": "clarify.respond",
+            "params": {"request_id": rid, "answer": "A"},
+        })
+        assert resp["result"]["status"] == "ok"
+        worker.join(timeout=5)
+        assert result["answer"] == "A"
+        expire_frames = [f for f in desktop.frames if f["params"]["type"] == "clarify.expire"]
+        assert len(expire_frames) == 1
+        assert expire_frames[0]["params"]["payload"]["request_id"] == rid
+
+        # desktop-origin turn：不向观察者广播 clarify。
+        session2 = _session(server, "sid-desk-cl", transport=_FakeTransport("p2"))
+        record2 = server._new_turn_record(session2, "x", sequence=1)
+        with session2["history_lock"]:
+            server._turn_state(session2).activate(record2)
+        frames_before = len(desktop.frames)
+
+        def _run_block_desktop():
+            server._block("clarify.request", "sid-desk-cl", {"question": "q"}, timeout=1)
+
+        worker2 = _threading.Thread(target=_run_block_desktop)
+        worker2.start()
+        worker2.join(timeout=5)
+        assert len(desktop.frames) == frames_before
+    finally:
+        server.unregister_desktop_observer(desktop)
+
+
 def test_channel_turn_lifecycle_broadcasts_to_desktop_observers(server):
     """channel-origin 的 turn 生命周期事件广播给所有 desktop 连接（即使该
     Session 没有任何订阅者），桌面据此在页面未打开时创建/刷新 Task snapshot；
