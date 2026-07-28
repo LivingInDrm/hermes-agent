@@ -29,6 +29,7 @@ import concurrent.futures
 import dataclasses
 import faulthandler
 import inspect
+import base64
 import json
 import logging
 import os
@@ -19915,6 +19916,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return url.rstrip("/")
         return None
 
+    @staticmethod
+    def _proxy_channel_origin_header(source) -> str:
+        """Encode the channel identity for an execution backend behind the proxy.
+
+        Base64url JSON rather than plain headers: chat names are user-authored
+        and routinely non-ASCII, which raw header values cannot carry.
+        """
+        try:
+            payload = {
+                "platform": getattr(getattr(source, "platform", None), "value", "") or "",
+                "chat_type": getattr(source, "chat_type", "") or "",
+                "chat_name": getattr(source, "chat_name", "") or "",
+                "chat_id": getattr(source, "chat_id", "") or "",
+                "thread_id": str(getattr(source, "thread_id", "") or ""),
+            }
+            if not payload["platform"]:
+                return ""
+            raw = json.dumps({k: v for k, v in payload.items() if v}, ensure_ascii=False)
+            return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+        except Exception:
+            return ""
+
     async def _run_agent_via_proxy(
         self,
         message: str,
@@ -19994,6 +20017,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+        if session_key:
+            # Conversation continuity. ``session_id`` is opaque and per-run;
+            # the session key is the stable per-chat identity that the gateway
+            # routing table and the session store already share. Without it a
+            # remote backend cannot tell *which* conversation this is, so it
+            # has no choice but to open a new one every time.
+            headers["X-Hermes-Session-Key"] = session_key
+        _origin_header = self._proxy_channel_origin_header(source)
+        if _origin_header:
+            headers["X-Hermes-Channel-Origin"] = _origin_header
 
         body = {
             "model": "hermes-agent",
