@@ -1060,10 +1060,17 @@ def build_session_key(
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
     profile: Optional[str] = None,
+    session_scope: str = "chat",
 ) -> str:
     """Build a deterministic session key from a message source.
 
     This is the single source of truth for session key construction.
+
+    ``session_scope`` selects the granularity. The default ``"chat"`` keeps the
+    per-chat rules described below byte-for-byte. ``"user"`` collapses every
+    chat, group and thread belonging to one person into a single session; it
+    raises when no stable user identity is available rather than degrading to
+    a chat key that could merge different people.
 
     ``profile`` selects the key namespace (see :func:`_session_key_namespace`).
     It defaults to ``None`` ⇒ the legacy ``agent:main`` namespace, so callers
@@ -1095,6 +1102,28 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+
+    if session_scope == "user":
+        # User-scoped sessions: one conversation per person, regardless of
+        # where they say it. A DM, a group mention, and a thread reply from
+        # the same human all continue the same session.
+        #
+        # Fail closed. Falling back to a chat-scoped key here would silently
+        # merge *different* people into one session whenever the identity is
+        # missing, which is a cross-user history leak — the exact failure the
+        # participant_id fallbacks above exist to prevent.
+        participant_id = source.user_id_alt or source.user_id
+        if not participant_id:
+            raise ValueError(
+                "session_scope='user' requires a stable user identity "
+                f"(platform={platform}, chat_type={source.chat_type})"
+            )
+        if source.platform == Platform.WHATSAPP:
+            participant_id = (
+                canonical_whatsapp_identifier(str(participant_id)) or participant_id
+            )
+        return ":".join([ns, platform, "user", str(participant_id)])
+
     slack_scope_id = (
         str(source.scope_id)
         if source.platform == Platform.SLACK and source.scope_id
@@ -1722,6 +1751,26 @@ class SessionStore:
 
         return recovered_profile == self._active_profile_name()
 
+    def _session_scope_for(self, source: SessionSource) -> str:
+        """Resolve the configured session scope for a source's platform.
+
+        Read from ``platforms.<name>.session_scope``; anything other than the
+        recognised ``"user"`` falls back to the default per-chat behaviour, so
+        a typo can never silently widen a session's reach.
+        """
+        platforms = getattr(self.config, "platforms", None) or {}
+        # ``config.platforms`` is keyed by the Platform enum. Looking it up with
+        # ``.value`` silently misses every time, so the scope would always fall
+        # back to per-chat — the setting would appear in config.yaml and do
+        # nothing. Try the enum first, then the string form for loaders that
+        # keep raw keys.
+        platform_cfg = platforms.get(source.platform)
+        if platform_cfg is None:
+            platform_cfg = platforms.get(getattr(source.platform, "value", source.platform))
+        extra = getattr(platform_cfg, "extra", None) or {}
+        scope = str(extra.get("session_scope") or "chat").strip().lower()
+        return "user" if scope == "user" else "chat"
+
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
         return build_session_key(
@@ -1729,6 +1778,7 @@ class SessionStore:
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
+            session_scope=self._session_scope_for(source),
         )
 
     def _legacy_slack_session_key(self, source: SessionSource) -> Optional[str]:
