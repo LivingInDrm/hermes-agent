@@ -10902,6 +10902,74 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+# Bounds for client-supplied display metadata (see prompt.submit). Rejecting
+# rather than truncating is deliberate: a caller that believes it labelled a
+# message must never be told "ok" while the label was silently dropped.
+_CLIENT_ANNOTATED_DISPLAY_KIND = "annotated"
+_DISPLAY_METADATA_MAX_KEYS = 16
+_DISPLAY_METADATA_MAX_DEPTH = 3
+_DISPLAY_METADATA_MAX_BYTES = 2048
+
+
+def _validated_display_metadata(raw: Any) -> dict | None:
+    """Validate optional client-supplied display metadata.
+
+    Returns None when absent. Raises ValueError with a caller-facing reason
+    when present but unacceptable.
+
+    Note what is *not* accepted: ``display_kind``. Clients annotate a message,
+    they never choose how it is classified — otherwise any client could send
+    ``display_kind="hidden"`` and make its own user row invisible to every
+    surface that reads the transcript projection.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("display_metadata must be a JSON object")
+    if len(raw) > _DISPLAY_METADATA_MAX_KEYS:
+        raise ValueError(
+            f"display_metadata accepts at most {_DISPLAY_METADATA_MAX_KEYS} keys"
+        )
+
+    def _too_deep() -> ValueError:
+        return ValueError(
+            f"display_metadata nests deeper than {_DISPLAY_METADATA_MAX_DEPTH} levels"
+        )
+
+    def _check(value: Any, depth: int) -> None:
+        # Depth counts containers, not leaves: a scalar sitting inside the
+        # deepest allowed object is at the limit, not past it.
+        if isinstance(value, dict):
+            if depth > _DISPLAY_METADATA_MAX_DEPTH:
+                raise _too_deep()
+            if len(value) > _DISPLAY_METADATA_MAX_KEYS:
+                raise ValueError(
+                    f"display_metadata accepts at most {_DISPLAY_METADATA_MAX_KEYS} keys"
+                )
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("display_metadata keys must be strings")
+                _check(item, depth + 1)
+        elif isinstance(value, list):
+            if depth > _DISPLAY_METADATA_MAX_DEPTH:
+                raise _too_deep()
+            for item in value:
+                _check(item, depth + 1)
+        elif not isinstance(value, (str, int, float, bool)) and value is not None:
+            raise ValueError("display_metadata values must be JSON scalars")
+
+    _check(raw, 1)
+    try:
+        encoded = json.dumps(raw, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("display_metadata must be JSON-serialisable") from exc
+    if len(encoded.encode("utf-8")) > _DISPLAY_METADATA_MAX_BYTES:
+        raise ValueError(
+            f"display_metadata exceeds {_DISPLAY_METADATA_MAX_BYTES} bytes"
+        )
+    return raw
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -10909,6 +10977,13 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    try:
+        client_display_metadata = _validated_display_metadata(params.get("display_metadata"))
+    except ValueError as exc:
+        # -32602 = JSON-RPC "invalid params". Reject the whole submit: a caller
+        # that believes it labelled this message must not get a silent success
+        # with the label dropped.
+        return _err(rid, -32602, str(exc))
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     if params.get("interrupted"):
         # Client-side barge-in (desktop VAD / typing over playback) — latch it
@@ -11083,7 +11158,16 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid, sid, session, text,
+            # Server-chosen, never client-chosen: both persistence paths gate on
+            # a display kind, and letting the client pick one would re-open the
+            # forgery hole (display_kind="hidden" drops the row from every
+            # transcript projection). "annotated" means exactly "an ordinary
+            # user message that carries metadata".
+            display_kind=_CLIENT_ANNOTATED_DISPLAY_KIND if client_display_metadata else None,
+            display_metadata=client_display_metadata,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -11999,11 +12083,11 @@ def _run_prompt_submit(
                 _run_params = {}
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
-            if display_kind and "persist_user_display_kind" in _run_params:
+            if (display_kind or display_metadata) and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
             result = agent.run_conversation(run_message, **run_kwargs)
-            if display_kind and isinstance(text, str):
+            if (display_kind or display_metadata) and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
                 if db is not None:
@@ -12020,7 +12104,8 @@ def _run_prompt_submit(
                 if isinstance(result, dict) and isinstance(result.get("messages"), list):
                     for message in reversed(result["messages"]):
                         if message.get("role") == "user" and message.get("content") == text:
-                            message["display_kind"] = display_kind
+                            if display_kind:
+                                message["display_kind"] = display_kind
                             if display_metadata:
                                 message["display_metadata"] = display_metadata
                             break
