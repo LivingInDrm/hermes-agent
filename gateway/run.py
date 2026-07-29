@@ -3392,6 +3392,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._busy_text_mode = self._load_busy_text_mode()
+        # Resolved once: the busy path must not read config (ack-debounce).
+        self._proxy_relay = bool(self._get_proxy_url())
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -6274,6 +6276,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cascade after the current turn finishes.
         if getattr(event, "internal", False):
             return False
+
+        # --- Proxy mode: the execution backend owns turn ordering ---
+        # A proxy-mode gateway is a relay, not the engine. Queueing a follow-up
+        # here hides it from the backend for the whole current run, so a message
+        # that arrived first can end up starting last: the backend sequences
+        # this session against its other clients and cannot account for input it
+        # has never been given. Forward it now and let the backend order it.
+        # Media and commands still queue — they need this gateway's own
+        # preprocessing before they mean anything to a remote agent.
+        if (
+            getattr(self, "_proxy_relay", False)
+            and event.message_type == MessageType.TEXT
+            and not event.media_urls
+            and not event.media_types
+            and not event.get_command()
+        ):
+            relay = asyncio.create_task(
+                self._forward_busy_message_via_proxy(event, session_key)
+            )
+            self._background_tasks.add(relay)
+            relay.add_done_callback(self._background_tasks.discard)
+            return True
 
         running_agent = self._running_agents.get(session_key)
 
@@ -20244,6 +20268,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
         }
+
+    async def _forward_busy_message_via_proxy(self, event, session_key: str) -> None:
+        """Relay a busy-session follow-up straight to the proxy backend.
+
+        Typing and streaming are owned by ``_run_agent_via_proxy``; only a reply
+        it did not already stream needs an explicit send here.
+        """
+        source = event.source
+        anchor = self._reply_anchor_for_event(event)
+        try:
+            entry = await self.async_session_store.get_or_create_session(source)
+            result = await self._run_agent_via_proxy(
+                message=event.text or "",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id=getattr(entry, "session_id", "") or session_key,
+                session_key=session_key,
+                event_message_id=event.message_id,
+            ) or {}
+            reply = result.get("final_response") or ""
+            adapter = self._adapter_for_source(source)
+            if adapter and reply and not result.get("response_previewed"):
+                await adapter._send_with_retry(
+                    chat_id=source.chat_id,
+                    content=reply,
+                    reply_to=anchor,
+                    metadata=self._thread_metadata_for_source(source, anchor),
+                )
+        except Exception:
+            logger.error("Proxy relay failed for session %s", session_key, exc_info=True)
 
     # ------------------------------------------------------------------
 
