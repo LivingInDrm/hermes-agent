@@ -632,6 +632,17 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
+def _lift_key_broker(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Propagate a MyAgents broker marker (Desktop Contract 5).
+
+    Non-sensitive; tells ``_resolve_named_custom_runtime`` to resolve the
+    credential via ``hermes_cli.myagents_providers`` and FAIL CLOSED.
+    """
+    key_broker = entry.get("key_broker")
+    if isinstance(key_broker, dict) and key_broker.get("account"):
+        result["key_broker"] = dict(key_broker)
+
+
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
@@ -720,6 +731,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     if api_mode:
                         result["api_mode"] = api_mode
                     _lift_max_output_tokens(entry, result)
+                    _lift_key_broker(entry, result)
                     return result
             # Also check the 'name' field if present
             display_name = entry.get("name", "")
@@ -743,6 +755,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         if api_mode:
                             result["api_mode"] = api_mode
                         _lift_max_output_tokens(entry, result)
+                        _lift_key_broker(entry, result)
                         return result
 
     # Fall back to custom_providers: list (legacy format)
@@ -1086,6 +1099,16 @@ def _resolve_named_custom_runtime(
     ).rstrip("/")
     if not base_url:
         return None
+
+    # MyAgents broker-managed route (Desktop Contract 5): credential comes from
+    # the desktop's loopback broker and FAILS CLOSED — deliberately bypasses
+    # the credential pool and the api_key candidate chain below (any fallback
+    # would silently switch billing accounts). Semantics live in the leaf
+    # module; this branch is dispatch only.
+    if custom_provider.get("key_broker"):
+        from hermes_cli.myagents_providers import resolve_broker_runtime
+
+        return resolve_broker_runtime(custom_provider, base_url, requested_provider)
 
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))

@@ -7771,6 +7771,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
+        # MyAgents desktop route overlay (Desktop Contract 5): process-constant,
+        # merged after managed so admin policy still wins. See the module
+        # docstring in hermes_cli/myagents_providers.py for the full contract.
+        from hermes_cli.myagents_providers import apply_providers_overlay
+
+        expanded = apply_providers_overlay(expanded)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -7917,6 +7923,11 @@ def save_config(
                     f"(managed by your administrator): {', '.join(sorted(_stripped))}",
                     file=sys.stderr,
                 )
+        # MyAgents route overlay: broker-backed provider entries are transient
+        # per-generation projections — never persist them (Desktop Contract 5).
+        from hermes_cli.myagents_providers import strip_overlay_providers
+
+        config = strip_overlay_providers(config)
         from utils import atomic_yaml_write
 
         ensure_hermes_home()
