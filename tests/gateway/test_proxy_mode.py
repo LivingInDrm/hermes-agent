@@ -1,5 +1,8 @@
 """Tests for gateway proxy mode — forwarding messages to a remote API server."""
 
+import base64
+import json
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -198,6 +201,7 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
+                        session_key="agent:main:matrix:group:room",
                     )
 
         # Verify request URL
@@ -208,6 +212,20 @@ class TestRunAgentViaProxy:
 
         # Verify session ID header
         assert session.captured_headers["X-Hermes-Session-Id"] == "session-abc"
+        assert session.captured_headers["X-Hermes-Session-Key"] == (
+            "agent:main:matrix:group:room"
+        )
+        origin = json.loads(
+            base64.urlsafe_b64decode(
+                session.captured_headers["X-Hermes-Channel-Origin"]
+            ).decode("utf-8")
+        )
+        assert origin == {
+            "platform": "matrix",
+            "chat_type": "group",
+            "chat_name": "Test Room",
+            "chat_id": "!room:server.org",
+        }
 
         # Verify messages include system, history, and current message
         messages = session.captured_json["messages"]
@@ -294,4 +312,3 @@ class TestEnvVarRegistration:
         info = OPTIONAL_ENV_VARS["GATEWAY_PROXY_URL"]
         assert info["category"] == "messaging"
         assert info["password"] is False
-

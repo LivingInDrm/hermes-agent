@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import base64
 import concurrent.futures
 import dataclasses
 import faulthandler
@@ -23499,6 +23500,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return url.rstrip("/")
         return None
 
+    @staticmethod
+    def _proxy_channel_origin_header(source: "SessionSource") -> str:
+        """Encode non-ASCII channel display context as base64url JSON."""
+        try:
+            platform = getattr(getattr(source, "platform", None), "value", "") or ""
+            if not platform:
+                return ""
+            payload = {
+                "platform": platform,
+                "chat_type": getattr(source, "chat_type", "") or "",
+                "chat_name": getattr(source, "chat_name", "") or "",
+                "chat_id": getattr(source, "chat_id", "") or "",
+                "thread_id": str(getattr(source, "thread_id", "") or ""),
+            }
+            raw = json.dumps(
+                {key: value for key, value in payload.items() if value},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+        except Exception:
+            return ""
+
     def _build_stream_consumer_config(
         self,
         source: "SessionSource",
@@ -23658,6 +23682,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+        if session_key:
+            headers["X-Hermes-Session-Key"] = session_key
+        origin_header = self._proxy_channel_origin_header(source)
+        if origin_header:
+            headers["X-Hermes-Channel-Origin"] = origin_header
 
         body = {
             "model": "hermes-agent",
