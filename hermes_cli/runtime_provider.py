@@ -661,6 +661,13 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
+def _lift_key_broker(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Propagate the non-sensitive MyAgents broker marker (Contract 5)."""
+    key_broker = entry.get("key_broker")
+    if isinstance(key_broker, dict) and key_broker.get("account"):
+        result["key_broker"] = dict(key_broker)
+
+
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
@@ -751,6 +758,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     if api_mode:
                         result["api_mode"] = api_mode
                     _lift_max_output_tokens(entry, result)
+                    _lift_key_broker(entry, result)
                     return result
 
     # Fall back to custom_providers: list (legacy format)
@@ -798,6 +806,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         if model_name:
             result["model"] = model_name
         _lift_max_output_tokens(entry, result)
+        _lift_key_broker(entry, result)
         return result
 
     return None
@@ -1108,6 +1117,14 @@ def _resolve_named_custom_runtime(
     ).rstrip("/")
     if not base_url:
         return None
+
+    # Desktop-managed routes resolve through a per-generation loopback lease.
+    # Dispatch before pools and ambient key fallbacks so account selection
+    # fails closed instead of silently switching credentials.
+    if custom_provider.get("key_broker"):
+        from hermes_cli.myagents_providers import resolve_broker_runtime
+
+        return resolve_broker_runtime(custom_provider, base_url, requested_provider)
 
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
