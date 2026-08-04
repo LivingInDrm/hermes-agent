@@ -67,10 +67,17 @@ def _pending_reaction_notes(session: dict) -> str:
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
+    from hermes_cli.myagents_prompt_metadata import validate_display_metadata
 
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    try:
+        client_display_metadata = validate_display_metadata(
+            params.get("display_metadata")
+        )
+    except ValueError as exc:
+        return _err(rid, -32602, str(exc))
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -323,7 +330,18 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            # Server-selected and deliberately non-hidden.  Clients can only
+            # supply metadata, never the row classification itself.
+            display_kind=(
+                "annotated" if client_display_metadata is not None else None
+            ),
+            display_metadata=client_display_metadata,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
