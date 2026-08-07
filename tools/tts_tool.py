@@ -75,7 +75,7 @@ def get_env_value(name, default=None):
     return default if value is None else value
 
 
-def _resolve_provider_key(env_var: str, provider_id: str) -> str:
+def _resolve_provider_key(env_var: str, provider_id: str, key_broker=None) -> str:
     """Resolve a TTS provider API key via the shared voice-key resolver.
 
     Delegates to ``tools.tool_backend_helpers.resolve_provider_secret`` —
@@ -88,7 +88,13 @@ def _resolve_provider_key(env_var: str, provider_id: str) -> str:
         from tools.tool_backend_helpers import resolve_provider_secret
     except ImportError:  # pragma: no cover — helpers are in-repo
         return str(get_env_value(env_var) or "").strip()
-    return resolve_provider_secret(env_var, provider_id, env_getter=get_env_value)
+    return resolve_provider_secret(
+        env_var,
+        provider_id,
+        env_getter=get_env_value,
+        key_broker=key_broker,
+        purpose="voice",
+    )
 
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
@@ -522,35 +528,42 @@ def _resolve_minimax_tts_runtime(
     if not isinstance(mm_config, dict):
         mm_config = {}
 
-    credentials = {
-        "global": (
-            "MINIMAX_API_KEY",
-            str(_resolve_provider_key("MINIMAX_API_KEY", "minimax") or "").strip(),
-        ),
-        "cn": (
-            "MINIMAX_CN_API_KEY",
-            str(_resolve_provider_key("MINIMAX_CN_API_KEY", "minimax") or "").strip(),
-        ),
-    }
     endpoints = {
         "global": DEFAULT_MINIMAX_BASE_URL,
         "cn": DEFAULT_MINIMAX_CN_BASE_URL,
     }
-
     configured_region = str(mm_config.get("region") or "").strip().lower()
     if configured_region and configured_region not in endpoints:
         raise ValueError("tts.minimax.region must be 'global' or 'cn'")
 
-    if configured_region:
-        region = configured_region
-    elif credentials["global"][1]:
-        region = "global"
-    elif credentials["cn"][1]:
-        region = "cn"
+    key_broker = mm_config.get("key_broker")
+    if key_broker is not None and not isinstance(key_broker, dict):
+        raise ValueError("tts.minimax.key_broker must be a mapping")
+    if key_broker is not None:
+        region = configured_region or "global"
+        env_var = "MINIMAX_API_KEY" if region == "global" else "MINIMAX_CN_API_KEY"
+        api_key = str(_resolve_provider_key(env_var, "minimax", key_broker) or "").strip()
+        credential_source = "MYAGENTS_RUNTIME_BROKER"
     else:
-        region = "global"
-
-    credential_source, api_key = credentials[region]
+        credentials = {
+            "global": (
+                "MINIMAX_API_KEY",
+                str(_resolve_provider_key("MINIMAX_API_KEY", "minimax") or "").strip(),
+            ),
+            "cn": (
+                "MINIMAX_CN_API_KEY",
+                str(_resolve_provider_key("MINIMAX_CN_API_KEY", "minimax") or "").strip(),
+            ),
+        }
+        if configured_region:
+            region = configured_region
+        elif credentials["global"][1]:
+            region = "global"
+        elif credentials["cn"][1]:
+            region = "cn"
+        else:
+            region = "global"
+        credential_source, api_key = credentials[region]
     if not api_key:
         raise ValueError(
             f"{credential_source} not set for MiniMax TTS region {region!r}"
@@ -1897,6 +1910,18 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     emotion = mm_config.get("emotion", "neutral")
     sample_rate = mm_config.get("sample_rate", 32000)
     bitrate = mm_config.get("bitrate", 128000)
+    language_boost = str(mm_config.get("language_boost") or "").strip()
+    allowed_language_boost = frozenset({
+        "auto", "Chinese", "Chinese,Yue", "English", "Arabic", "Russian",
+        "Spanish", "French", "Portuguese", "German", "Turkish", "Dutch",
+        "Ukrainian", "Vietnamese", "Indonesian", "Japanese", "Italian",
+        "Korean", "Thai", "Polish", "Romanian", "Greek", "Czech", "Finnish",
+        "Hindi", "Bulgarian", "Danish", "Hebrew", "Malay", "Persian",
+        "Slovak", "Swedish", "Croatian", "Filipino", "Hungarian", "Norwegian",
+        "Slovenian", "Catalan", "Nynorsk", "Tamil", "Afrikaans",
+    })
+    if language_boost and language_boost not in allowed_language_boost:
+        raise ValueError("tts.minimax.language_boost is not supported")
 
     # MiniMax accounts scope TTS requests by GroupId.  When present, the docs
     # show it as a ?GroupId=<id> query param on the t2a_v2 URL.  Accept it
@@ -1937,6 +1962,8 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
                 "channel": 1,
             },
         }
+        if language_boost:
+            payload["language_boost"] = language_boost
     else:
         # text_to_speech endpoint: flat payload
         payload = {
