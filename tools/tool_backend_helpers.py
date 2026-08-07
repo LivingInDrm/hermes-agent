@@ -160,6 +160,8 @@ def resolve_provider_secret(
     provider_id: str,
     config_value: str = "",
     env_getter=None,
+    key_broker=None,
+    purpose: str = "voice",
 ) -> str:
     """Resolve a voice-provider API key. Single owner for STT/TTS key lookup.
 
@@ -167,24 +169,32 @@ def resolve_provider_secret(
     <provider>`` were invisible to the voice tools, which only consulted
     env/.env):
 
-    1. An explicit ``config_value`` from config.yaml, when the caller has one.
-    2. The environment / ``~/.hermes/.env``. Under a multiplexed gateway turn
+    1. A declared ``key_broker``. Broker errors propagate and prohibit every
+       fallback so the selected desktop billing account cannot drift.
+    2. An explicit ``config_value`` from config.yaml, when the caller has one.
+    3. The environment / ``~/.hermes/.env``. Under a multiplexed gateway turn
        this reads the active profile's secret scope (authoritative — a scope
        miss must NOT borrow another profile's ``os.environ``; see
        ``agent/secret_scope.py``). Outside multiplexing it reads
        ``hermes_cli.config.get_env_value`` (os.environ, then ``.env``),
        matching the tools' historical behaviour exactly.
-    3. The credential pool / auth store for ``provider_id`` (``hermes auth
+    4. The credential pool / auth store for ``provider_id`` (``hermes auth
        add <provider_id>``). Skipped under an active multiplex turn, where
        only the profile scope is authoritative for credentials.
 
-    Never raises — credential resolution must not hard-fail on a pool or
-    config read; returns ``""`` when no key is found anywhere.
+    Without ``key_broker`` this never raises and returns ``""`` when no key is
+    found. A broker-backed lookup intentionally propagates its categorized,
+    secret-free failure.
 
     ``env_getter`` lets callers supply their module-level ``get_env_value``
     wrapper (transcription_tools / tts_tool expose one that tests patch);
     when omitted, ``hermes_cli.config.get_env_value`` is used directly.
     """
+    if key_broker is not None:
+        from hermes_cli.myagents_providers import fetch_broker_api_key
+
+        return fetch_broker_api_key(key_broker, purpose=purpose)
+
     value = str(config_value or "").strip()
     if value:
         return value

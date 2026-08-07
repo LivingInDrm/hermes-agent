@@ -112,8 +112,21 @@ providers:
 def test_broker_roundtrip_preserves_existing_query(broker) -> None:
     assert fetch_broker_api_key({"account": "pa abc"}) == "sk-from-broker"
     assert broker.requests == [
-        ("/credential?generation=7&account=pa+abc", "Bearer capability-token-1")
+        ("/credential?generation=7&account=pa+abc&purpose=model", "Bearer capability-token-1")
     ]
+
+
+def test_broker_voice_purpose_is_explicit(broker) -> None:
+    assert fetch_broker_api_key({"account": "pa-voice"}, purpose="voice") == "sk-from-broker"
+    assert broker.requests == [
+        ("/credential?generation=7&account=pa-voice&purpose=voice", "Bearer capability-token-1")
+    ]
+
+
+def test_broker_rejects_unknown_purpose_before_network(broker) -> None:
+    with pytest.raises(BrokerCredentialError, match="invalid credential purpose"):
+        fetch_broker_api_key({"account": "pa-voice"}, purpose="billing")
+    assert broker.requests == []
 
 
 @pytest.mark.parametrize("status", [401, 403, 404, 409])

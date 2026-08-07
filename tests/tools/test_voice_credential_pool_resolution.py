@@ -130,6 +130,44 @@ class TestConfigPrecedence:
             )
 
 
+class TestBrokerPrecedence:
+    def test_broker_wins_before_config_env_and_pool(self, monkeypatch):
+        monkeypatch.setenv("MINIMAX_API_KEY", "env-key-must-not-win")
+        with patch(
+            "hermes_cli.myagents_providers.fetch_broker_api_key",
+            return_value="broker-key",
+        ) as fetch, patch(
+            "agent.credential_pool.load_pool",
+            return_value=_fake_pool("pool-key-must-not-win"),
+        ) as pool:
+            assert resolve_provider_secret(
+                "MINIMAX_API_KEY",
+                "minimax",
+                config_value="config-key-must-not-win",
+                key_broker={"account": "pa-voice"},
+                purpose="voice",
+            ) == "broker-key"
+        fetch.assert_called_once_with({"account": "pa-voice"}, purpose="voice")
+        pool.assert_not_called()
+
+    def test_broker_error_propagates_without_fallback(self, monkeypatch):
+        from hermes_cli.myagents_providers import BrokerCredentialError
+
+        monkeypatch.setenv("MINIMAX_API_KEY", "env-key-must-not-win")
+        with patch(
+            "hermes_cli.myagents_providers.fetch_broker_api_key",
+            side_effect=BrokerCredentialError("credential broker refused (HTTP 403)"),
+        ):
+            with pytest.raises(BrokerCredentialError, match="HTTP 403"):
+                resolve_provider_secret(
+                    "MINIMAX_API_KEY",
+                    "minimax",
+                    config_value="config-key-must-not-win",
+                    key_broker={"account": "pa-voice"},
+                    purpose="voice",
+                )
+
+
 class TestMultiplexScope:
     """Under multiplexing the profile scope is authoritative — no pool borrow."""
 

@@ -20,8 +20,8 @@ import urllib.request
 from typing import Any, Dict, Optional
 
 
-BROKER_URL_ENV = "MYAGENTS_MODEL_BROKER_URL"
-BROKER_TOKEN_ENV = "MYAGENTS_MODEL_BROKER_TOKEN"
+BROKER_URL_ENV = "MYAGENTS_RUNTIME_BROKER_URL"
+BROKER_TOKEN_ENV = "MYAGENTS_RUNTIME_BROKER_TOKEN"
 
 _BROKER_TIMEOUT_SECONDS = 5.0
 _BROKER_RESPONSE_LIMIT = 64 * 1024
@@ -31,20 +31,23 @@ class BrokerCredentialError(RuntimeError):
     """A broker credential is unavailable; messages contain categories only."""
 
 
-def _credential_url(base_url: str, account: str) -> str:
+def _credential_url(base_url: str, account: str, purpose: str) -> str:
     parsed = urllib.parse.urlsplit(base_url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query.append(("account", account))
+    query.append(("purpose", purpose))
     return urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), parsed.fragment)
     )
 
 
-def fetch_broker_api_key(key_broker: dict) -> str:
+def fetch_broker_api_key(key_broker: dict, purpose: str = "model") -> str:
     """Fetch the current credential for a broker-backed route; fail closed."""
     account = str((key_broker or {}).get("account") or "").strip()
     if not account:
         raise BrokerCredentialError("credential broker: route has no account id")
+    if purpose not in {"model", "voice"}:
+        raise BrokerCredentialError("credential broker: invalid credential purpose")
 
     url = os.environ.get(BROKER_URL_ENV, "").strip()
     token = os.environ.get(BROKER_TOKEN_ENV, "").strip()
@@ -54,7 +57,7 @@ def fetch_broker_api_key(key_broker: dict) -> str:
         )
 
     request = urllib.request.Request(
-        _credential_url(url, account),
+        _credential_url(url, account, purpose),
         headers={"Authorization": f"Bearer {token}"},
         method="GET",
     )
@@ -89,7 +92,7 @@ def resolve_broker_runtime(
         "provider": "custom",
         "api_mode": custom_provider.get("api_mode") or "chat_completions",
         "base_url": base_url,
-        "api_key": fetch_broker_api_key(custom_provider.get("key_broker") or {}),
+        "api_key": fetch_broker_api_key(custom_provider.get("key_broker") or {}, purpose="model"),
         "source": f"myagents_broker:{custom_provider.get('name', requested_provider or '')}",
     }
     if custom_provider.get("model"):
