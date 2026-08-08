@@ -420,6 +420,22 @@ def test_forward_env_overrides_docker_env_in_init_args(monkeypatch):
     assert "MY_KEY=static_value" not in args_str
 
 
+def test_forward_env_cannot_expose_myagents_runtime_capability(monkeypatch):
+    env = _make_execute_only_env(forward_env=[
+        "MYAGENTS_RUNTIME_BROKER_URL",
+        "MYAGENTS_RUNTIME_BROKER_TOKEN",
+    ])
+    monkeypatch.setenv("MYAGENTS_RUNTIME_BROKER_URL", "http://127.0.0.1:45678/credential")
+    monkeypatch.setenv("MYAGENTS_RUNTIME_BROKER_TOKEN", "fake-broker-token")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    args = env._build_init_env_args()
+    args_str = " ".join(args)
+
+    assert "MYAGENTS_RUNTIME_BROKER_URL=" not in args_str
+    assert "MYAGENTS_RUNTIME_BROKER_TOKEN=" not in args_str
+
+
 def test_normalize_env_dict_filters_invalid_keys():
     """_normalize_env_dict should reject invalid variable names."""
     result = docker_env._normalize_env_dict({

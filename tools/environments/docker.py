@@ -1527,7 +1527,11 @@ class DockerEnvironment(BaseEnvironment):
     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
         """Return forwarded values and scoped names that must be unset."""
         exec_env: dict[str, str] = {}
-        explicit_forward_keys = set(self._forward_env)
+        # Process-local Hermes capabilities must never cross into the model's
+        # container, even through the explicit docker_forward_env escape hatch.
+        explicit_forward_keys = {
+            key for key in self._forward_env if not _is_hermes_internal_secret(key)
+        }
         passthrough_keys: set[str] = set()
         resolve_passthrough_value = None
         multiplex_active = False
