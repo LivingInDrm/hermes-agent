@@ -649,6 +649,30 @@ class TestHermesInternalDynamicSecrets:
         assert _is_hermes_internal_secret("GATEWAY_RELAY_DELIVERY_KEY")
         assert _is_hermes_internal_secret("GATEWAY_RELAY_SESSION_TOKEN")
 
+    def test_predicate_matches_myagents_runtime_capability(self):
+        from tools.environments.local import _is_hermes_internal_secret
+        assert _is_hermes_internal_secret("MYAGENTS_RUNTIME_BROKER_URL")
+        assert _is_hermes_internal_secret("MYAGENTS_RUNTIME_BROKER_TOKEN")
+
+    def test_myagents_runtime_capability_cannot_be_forced_or_passthrough(self):
+        from tools.environments.local import _sanitize_subprocess_env
+        with patch(
+            "tools.env_passthrough.is_env_passthrough",
+            return_value=True,
+        ):
+            result = _sanitize_subprocess_env(
+                {
+                    "MYAGENTS_RUNTIME_BROKER_URL": "http://127.0.0.1:45678/credential",
+                    "MYAGENTS_RUNTIME_BROKER_TOKEN": "fake-broker-token",
+                },
+                {
+                    f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}MYAGENTS_RUNTIME_BROKER_URL": "http://127.0.0.1:45678/credential",
+                    f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}MYAGENTS_RUNTIME_BROKER_TOKEN": "fake-broker-token",
+                },
+            )
+        assert "MYAGENTS_RUNTIME_BROKER_URL" not in result
+        assert "MYAGENTS_RUNTIME_BROKER_TOKEN" not in result
+
     def test_predicate_allows_auxiliary_non_secrets(self):
         """AUXILIARY_*_PROVIDER / _MODEL and GATEWAY_RELAY_* routing hints are
         NOT secrets and must remain visible so tooling that reads them works."""

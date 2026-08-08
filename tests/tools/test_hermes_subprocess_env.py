@@ -42,6 +42,11 @@ _SAFE_SAMPLE = {
     "MY_APP_VAR": "keep-me",
 }
 
+_MYAGENTS_RUNTIME_CAPABILITY_SAMPLE = {
+    "MYAGENTS_RUNTIME_BROKER_URL": "http://127.0.0.1:45678/credential",
+    "MYAGENTS_RUNTIME_BROKER_TOKEN": "fake-broker-token",
+}
+
 
 def _build(extra=None, *, inherit_credentials=False):
     env = dict(_SAFE_SAMPLE)
@@ -112,6 +117,17 @@ class TestTierInvariants:
 
     def test_tier1_covers_infra_secrets(self):
         assert {"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY"} <= _ALWAYS_STRIP_KEYS
+
+    def test_myagents_runtime_capability_never_reaches_children(self):
+        for inherit in (False, True):
+            result = _build(
+                _MYAGENTS_RUNTIME_CAPABILITY_SAMPLE,
+                inherit_credentials=inherit,
+            )
+            for var in _MYAGENTS_RUNTIME_CAPABILITY_SAMPLE:
+                assert var not in result, (
+                    f"{var} leaked with inherit_credentials={inherit}"
+                )
 
 
 class TestBrowserPassthroughPattern:

@@ -348,14 +348,26 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # these markers is safe and only prevents the cross-project clobber (#23473).
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
+# Process-local capabilities injected by the MyAgents desktop.  The Hermes
+# host needs these to resolve managed model/TTS credentials in-process, but no
+# model-authored child command has a legitimate reason to inherit either half
+# of the capability.  Treat both names as Tier-1 internal secrets even though
+# the broker URL is not itself a conventional KEY/TOKEN variable.
+_MYAGENTS_RUNTIME_CAPABILITY_ENV_VARS = frozenset({
+    "MYAGENTS_RUNTIME_BROKER_URL",
+    "MYAGENTS_RUNTIME_BROKER_TOKEN",
+})
+
 
 def _is_hermes_internal_secret(key: str) -> bool:
-    """Return True for Hermes-internal secrets injected under *dynamic* names.
+    """Return True for Hermes-internal process capabilities and dynamic secrets.
 
     ``_HERMES_PROVIDER_ENV_BLOCKLIST`` is name-based and derived from the
-    provider/tool registries, but the gateway and CLI also inject secrets into
-    ``os.environ`` at runtime under names no static registry knows about:
+    provider/tool registries, but the host also injects capabilities into
+    ``os.environ`` that no child process should receive:
 
+    - ``MYAGENTS_RUNTIME_BROKER_URL`` / ``_TOKEN`` — the two-part process-local
+      credential-broker capability injected by the MyAgents desktop.
     - ``AUXILIARY_<TASK>_API_KEY`` / ``AUXILIARY_<TASK>_BASE_URL`` — per-task
       side-LLM credentials bridged from ``config.yaml[auxiliary]`` by
       ``gateway/run.py`` and ``cli.py`` (vision, web_extract, approval,
@@ -383,6 +395,8 @@ def _is_hermes_internal_secret(key: str) -> bool:
     a model-driving CLI legitimately needs matches these patterns.
     """
     upper = key.upper()
+    if upper in _MYAGENTS_RUNTIME_CAPABILITY_ENV_VARS:
+        return True
     if upper.startswith("AUXILIARY_") and (
         upper.endswith("_API_KEY") or upper.endswith("_BASE_URL")
     ):
