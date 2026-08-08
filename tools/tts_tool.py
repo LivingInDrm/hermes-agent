@@ -1040,10 +1040,12 @@ def _run_command_tts(
     propagating delegated-child lineage markers when applicable.
     """
     from agent.delegation_context import delegated_child_subprocess_env
-    from tools.environments.local import hermes_subprocess_env
+    from tools.environments.local import hermes_subprocess_env, _is_hermes_internal_secret
 
     scrubbed = hermes_subprocess_env(inherit_credentials=False)
     for key in env_passthrough or []:
+        if _is_hermes_internal_secret(key):
+            continue
         value = os.environ.get(key)
         if value is not None:
             scrubbed[key] = value

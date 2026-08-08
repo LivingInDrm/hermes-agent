@@ -108,6 +108,8 @@ class TestCommandTtsEnv:
         monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "sk-vision")
         monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        monkeypatch.setenv("MYAGENTS_RUNTIME_BROKER_URL", "http://127.0.0.1:45678/credential")
+        monkeypatch.setenv("MYAGENTS_RUNTIME_BROKER_TOKEN", "fake-broker-token")
         monkeypatch.setenv("MY_SAFE_TTS_VAR", "keep")
 
         captured = {}
@@ -130,13 +132,22 @@ class TestCommandTtsEnv:
 
         monkeypatch.setattr("tools.tts_tool.subprocess.Popen", fake_popen)
 
-        result = _run_command_tts("echo hi", timeout=1)
+        result = _run_command_tts(
+            "echo hi",
+            timeout=1,
+            env_passthrough=[
+                "MYAGENTS_RUNTIME_BROKER_URL",
+                "MYAGENTS_RUNTIME_BROKER_TOKEN",
+            ],
+        )
 
         assert result.returncode == 0
         env = captured["env"]
         assert "AUXILIARY_VISION_API_KEY" not in env
         assert "GATEWAY_RELAY_SECRET" not in env
         assert "OPENAI_API_KEY" not in env
+        assert "MYAGENTS_RUNTIME_BROKER_URL" not in env
+        assert "MYAGENTS_RUNTIME_BROKER_TOKEN" not in env
         assert env["MY_SAFE_TTS_VAR"] == "keep"
 
 
