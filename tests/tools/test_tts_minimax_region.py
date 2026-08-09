@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from tools.tts_tool import (
     DEFAULT_MINIMAX_BASE_URL,
@@ -270,6 +271,89 @@ def test_t2a_payload_forwards_controlled_language_boost(monkeypatch, tmp_path):
     assert post.call_args.kwargs["json"]["language_boost"] == "auto"
     assert post.call_args.kwargs["json"]["model"] == "speech-2.8-hd"
     assert output.read_bytes() == b"\x01\x02"
+
+
+def test_minimax_retries_one_transient_connection_failure(monkeypatch, tmp_path):
+    response = MagicMock()
+    post = MagicMock(side_effect=[
+        requests.exceptions.ConnectionError("remote disconnected"),
+        response,
+    ])
+    sleep = MagicMock()
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("tools.tts_tool.time.sleep", sleep)
+    monkeypatch.setattr(
+        "tools.tts_tool._read_tts_response_json",
+        lambda _response, label: {
+            "base_resp": {"status_code": 0},
+            "data": {"audio": "0102"},
+        },
+    )
+    monkeypatch.setattr(
+        "tools.tts_tool._resolve_minimax_tts_runtime",
+        lambda _config: type("Runtime", (), {
+            "endpoint": DEFAULT_MINIMAX_BASE_URL,
+            "api_key": "VOICE_BROKER_CREDENTIAL",
+        })(),
+    )
+    output = tmp_path / "voice.mp3"
+
+    _generate_minimax_tts("hello", str(output), {})
+
+    assert post.call_count == 2
+    sleep.assert_called_once_with(0.5)
+    assert output.read_bytes() == b"\x01\x02"
+
+
+def test_minimax_retries_documented_transient_api_error(monkeypatch, tmp_path):
+    post = MagicMock(return_value=MagicMock())
+    responses = iter([
+        {"base_resp": {"status_code": 1001, "status_msg": "request timeout"}},
+        {"base_resp": {"status_code": 0}, "data": {"audio": "0102"}},
+    ])
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("tools.tts_tool.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "tools.tts_tool._read_tts_response_json",
+        lambda _response, label: next(responses),
+    )
+    monkeypatch.setattr(
+        "tools.tts_tool._resolve_minimax_tts_runtime",
+        lambda _config: type("Runtime", (), {
+            "endpoint": DEFAULT_MINIMAX_BASE_URL,
+            "api_key": "VOICE_BROKER_CREDENTIAL",
+        })(),
+    )
+
+    _generate_minimax_tts("hello", str(tmp_path / "voice.mp3"), {})
+
+    assert post.call_count == 2
+
+
+def test_minimax_does_not_retry_permanent_api_error(monkeypatch, tmp_path):
+    post = MagicMock(return_value=MagicMock())
+    sleep = MagicMock()
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("tools.tts_tool.time.sleep", sleep)
+    monkeypatch.setattr(
+        "tools.tts_tool._read_tts_response_json",
+        lambda _response, label: {
+            "base_resp": {"status_code": 2013, "status_msg": "invalid params"},
+        },
+    )
+    monkeypatch.setattr(
+        "tools.tts_tool._resolve_minimax_tts_runtime",
+        lambda _config: type("Runtime", (), {
+            "endpoint": DEFAULT_MINIMAX_BASE_URL,
+            "api_key": "VOICE_BROKER_CREDENTIAL",
+        })(),
+    )
+
+    with pytest.raises(RuntimeError, match="code 2013"):
+        _generate_minimax_tts("hello", str(tmp_path / "voice.mp3"), {})
+
+    post.assert_called_once()
+    sleep.assert_not_called()
 
 
 def test_invalid_language_boost_is_rejected_before_http(monkeypatch, tmp_path):

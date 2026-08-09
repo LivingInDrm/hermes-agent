@@ -1880,6 +1880,42 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
 # ===========================================================================
 # Provider: MiniMax TTS
 # ===========================================================================
+_MINIMAX_TTS_MAX_ATTEMPTS = 2
+_MINIMAX_TTS_RETRY_DELAY_SECONDS = 0.5
+_MINIMAX_TTS_RETRYABLE_API_CODES = frozenset({1000, 1001, 1002, 1024, 1033, 1039})
+
+
+class _MiniMaxTTSAPIError(RuntimeError):
+    """MiniMax returned a structured non-success status."""
+
+    def __init__(self, status_code: int, status_message: str):
+        self.status_code = status_code
+        super().__init__(
+            f"MiniMax TTS API error (code {status_code}): {status_message}"
+        )
+
+
+def _minimax_tts_error_is_retryable(error: Exception, requests_module: Any) -> bool:
+    if isinstance(error, _MiniMaxTTSAPIError):
+        return error.status_code in _MINIMAX_TTS_RETRYABLE_API_CODES
+    if isinstance(
+        error,
+        (
+            requests_module.exceptions.ConnectionError,
+            requests_module.exceptions.Timeout,
+            requests_module.exceptions.ChunkedEncodingError,
+        ),
+    ):
+        return True
+    if isinstance(error, requests_module.exceptions.HTTPError):
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+        return status_code in {408, 429} or (
+            isinstance(status_code, int) and status_code >= 500
+        )
+    return False
+
+
 def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """
     Generate audio using MiniMax TTS API.
@@ -1974,59 +2010,88 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
             "voice_id": voice_id,
         }
 
-    response = requests.post(
-        base_url,
-        json=payload,
-        headers=headers,
-        timeout=60,
-        stream=True,
-    )
-
-    if is_t2a_v2:
-        # t2a_v2 returns JSON with hex-encoded audio
-        response.raise_for_status()
-        result = _read_tts_response_json(response, label="MiniMax TTS")
-        base_resp = result.get("base_resp", {})
-        status_code = base_resp.get("status_code", -1)
-
-        if status_code != 0:
-            status_msg = base_resp.get("status_msg", "unknown error")
-            raise RuntimeError(f"MiniMax TTS API error (code {status_code}): {status_msg}")
-
-        hex_audio = result.get("data", {}).get("audio", "")
-        if not hex_audio:
-            raise RuntimeError("MiniMax TTS returned empty audio data")
-
-        audio_bytes = bytes.fromhex(hex_audio)
-        with open(output_path, "wb") as f:
-            f.write(audio_bytes)
-        return output_path
-
-    else:
-        # text_to_speech returns raw audio directly
-        content_type = response.headers.get("Content-Type", "")
-
-        if "audio/" in content_type:
-            _write_tts_response_to_file(response, output_path, label="MiniMax TTS")
-            return output_path
-
-        # Fallback: try parsing as JSON
+    for attempt in range(1, _MINIMAX_TTS_MAX_ATTEMPTS + 1):
+        response = None
         try:
-            raw_body = _read_tts_response_bytes(response, label="MiniMax TTS")
-            result = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            base_resp = result.get("base_resp", {})
-            status_code = base_resp.get("status_code", -1)
-            if status_code != 0:
-                status_msg = base_resp.get("status_msg", "unknown error")
-                raise RuntimeError(f"MiniMax TTS API error (code {status_code}): {status_msg}")
-        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-            response.raise_for_status()
-            raise RuntimeError(
-                f"MiniMax TTS returned unexpected Content-Type '{content_type}' "
-                f"({len(raw_body) if 'raw_body' in locals() else 0} bytes)"
+            response = requests.post(
+                base_url,
+                json=payload,
+                headers=headers,
+                timeout=60,
+                stream=True,
             )
 
-        raise RuntimeError("MiniMax TTS returned no audio data")
+            if is_t2a_v2:
+                # t2a_v2 returns JSON with hex-encoded audio
+                response.raise_for_status()
+                result = _read_tts_response_json(response, label="MiniMax TTS")
+                base_resp = result.get("base_resp", {})
+                status_code = base_resp.get("status_code", -1)
+
+                if status_code != 0:
+                    status_msg = base_resp.get("status_msg", "unknown error")
+                    try:
+                        numeric_status_code = int(status_code)
+                    except (TypeError, ValueError):
+                        numeric_status_code = -1
+                    raise _MiniMaxTTSAPIError(numeric_status_code, str(status_msg))
+
+                hex_audio = result.get("data", {}).get("audio", "")
+                if not hex_audio:
+                    raise RuntimeError("MiniMax TTS returned empty audio data")
+
+                audio_bytes = bytes.fromhex(hex_audio)
+                with open(output_path, "wb") as f:
+                    f.write(audio_bytes)
+                return output_path
+
+            # text_to_speech returns raw audio directly
+            content_type = response.headers.get("Content-Type", "")
+
+            if "audio/" in content_type:
+                _write_tts_response_to_file(response, output_path, label="MiniMax TTS")
+                return output_path
+
+            # Fallback: try parsing as JSON
+            try:
+                raw_body = _read_tts_response_bytes(response, label="MiniMax TTS")
+                result = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+                base_resp = result.get("base_resp", {})
+                status_code = base_resp.get("status_code", -1)
+                if status_code != 0:
+                    status_msg = base_resp.get("status_msg", "unknown error")
+                    try:
+                        numeric_status_code = int(status_code)
+                    except (TypeError, ValueError):
+                        numeric_status_code = -1
+                    raise _MiniMaxTTSAPIError(numeric_status_code, str(status_msg))
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                response.raise_for_status()
+                raise RuntimeError(
+                    f"MiniMax TTS returned unexpected Content-Type '{content_type}' "
+                    f"({len(raw_body) if 'raw_body' in locals() else 0} bytes)"
+                )
+
+            raise RuntimeError("MiniMax TTS returned no audio data")
+        except Exception as error:
+            if response is not None:
+                _close_response(response)
+            if (
+                attempt >= _MINIMAX_TTS_MAX_ATTEMPTS
+                or not _minimax_tts_error_is_retryable(error, requests)
+            ):
+                raise
+            logger.warning(
+                "MiniMax TTS transient failure on attempt %d/%d; "
+                "retrying in %.1fs (%s)",
+                attempt,
+                _MINIMAX_TTS_MAX_ATTEMPTS,
+                _MINIMAX_TTS_RETRY_DELAY_SECONDS,
+                type(error).__name__,
+            )
+            time.sleep(_MINIMAX_TTS_RETRY_DELAY_SECONDS)
+
+    raise RuntimeError("MiniMax TTS retry loop exhausted")  # pragma: no cover
 
 
 # ===========================================================================
